@@ -1,7 +1,4 @@
-Your Comics!
-The ulimate comic book tool!
-
-# Comic Library & Vault Analyzer
+# Your Comics, the ultumate comic book tool!
 
 A powerhouse offline comic book library manager supercharged with modern AI, text-to-speech capabilities, and seamless web scraping. This application bridges the gap between a lightweight local file browser and an advanced comic research tool.
 
