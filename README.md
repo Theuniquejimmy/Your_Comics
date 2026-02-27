@@ -1,4 +1,4 @@
-# yourcomics
+Your Comics!
 The ulimate comic book tool!
 
 # Comic Library & Vault Analyzer
