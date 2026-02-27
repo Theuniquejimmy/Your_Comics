@@ -1,0 +1,1884 @@
+import sys
+import os
+import zipfile
+import xml.etree.ElementTree as ET
+import json
+import subprocess
+import hashlib
+import requests
+import re
+import asyncio
+import edge_tts
+import markdown
+import random
+import time
+import tempfile
+import shutil
+from google import genai
+from ebooklib import epub
+
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QTreeView, QWidget, 
+                             QVBoxLayout, QLabel, QSplitter, QTextBrowser, 
+                             QHeaderView, QListWidget, QPushButton, QHBoxLayout,
+                             QLineEdit, QTabWidget, QListWidgetItem, QComboBox, 
+                             QProgressBar, QFileDialog, QMessageBox, QSlider, QDialog, QMenu)
+from PyQt6.QtGui import QPixmap, QFileSystemModel, QIcon
+from PyQt6.QtCore import Qt, QDir, QSize, QThread, pyqtSignal, QSortFilterProxyModel, QUrl, QTimer
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+
+try:
+    import rarfile
+    rarfile.UNRAR_TOOL = r"C:\Program Files\WinRAR\UnRAR.exe" 
+    HAS_RAR = True
+except ImportError:
+    HAS_RAR = False
+    
+# --- BACKGROUND THREAD FOR CONVERTING & TAGGING ---
+class ComicConverterThread(QThread):
+    finished_conversion = pyqtSignal(bool, str, str)
+    progress_update = pyqtSignal(int, int) # Sends (current_file, total_files)
+    status_update = pyqtSignal(str)        # Sends text updates like "Extracting..."
+
+    def __init__(self, file_path, xml_string):
+        super().__init__()
+        self.file_path = file_path
+        self.xml_string = xml_string
+
+    def run(self):
+        try:
+            dir_name = os.path.dirname(self.file_path)
+            base_name, ext = os.path.splitext(os.path.basename(self.file_path))
+            new_cbz_path = os.path.join(dir_name, base_name + ".cbz")
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                self.status_update.emit("Extracting archive...")
+                
+                # 1. Extract files one by one to report progress
+                if ext.lower() == '.cbr' and HAS_RAR:
+                    with rarfile.RarFile(self.file_path, 'r') as rf:
+                        files = rf.infolist()
+                        for i, f in enumerate(files):
+                            rf.extract(f, temp_dir)
+                            self.progress_update.emit(i + 1, len(files))
+                            
+                elif ext.lower() == '.cbz':
+                    with zipfile.ZipFile(self.file_path, 'r') as zf:
+                        files = zf.infolist()
+                        for i, f in enumerate(files):
+                            zf.extract(f, temp_dir)
+                            self.progress_update.emit(i + 1, len(files))
+                else:
+                    self.finished_conversion.emit(False, "Unsupported format.", "")
+                    return
+
+                self.status_update.emit("Generating metadata...")
+                xml_path = os.path.join(temp_dir, 'ComicInfo.xml')
+                with open(xml_path, 'w', encoding='utf-8') as f:
+                    f.write(self.xml_string)
+
+                self.status_update.emit("Creating new CBZ...")
+                temp_cbz = new_cbz_path + ".tmp"
+                
+                # Gather all files to zip so we know the total count
+                all_files = []
+                for root, _, files in os.walk(temp_dir):
+                    for file in files:
+                        if file.lower() == 'comicinfo.xml' and root != temp_dir:
+                            continue
+                        all_files.append(os.path.join(root, file))
+
+                # 2. Zip files one by one to report progress
+                with zipfile.ZipFile(temp_cbz, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for i, full_path in enumerate(all_files):
+                        arcname = os.path.relpath(full_path, temp_dir) 
+                        zf.write(full_path, arcname)
+                        self.progress_update.emit(i + 1, len(all_files))
+
+            self.status_update.emit("Finalizing file...")
+            os.replace(temp_cbz, new_cbz_path) 
+            
+            if ext.lower() == '.cbr' and os.path.exists(self.file_path):
+                os.remove(self.file_path)
+
+            self.finished_conversion.emit(True, "Successfully converted and tagged!", new_cbz_path)
+
+        except Exception as e:
+            self.finished_conversion.emit(False, f"Error: {e}", "")
+
+# --- CONFIGURATION & API KEYS ---
+CACHE_DIR = ".comic_cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+COMIC_VINE_KEY = os.environ.get("COMIC_VINE_KEY", "YOUR_COMIC_VINE_KEY_HERE")
+GEMINI_KEY = os.environ.get("GEMINI_KEY", "YOUR_GEMINI_KEY_HERE")
+
+# --- BACKGROUND THREADS ---
+
+class CoverLoaderThread(QThread):
+    cover_loaded = pyqtSignal(str, bytes)
+
+    def __init__(self, file_paths):
+        super().__init__()
+        self.file_paths = file_paths
+        self._is_running = True
+
+    def run(self):
+        for file_path in self.file_paths:
+            if not self._is_running: break 
+            try:
+                norm_path = os.path.normpath(file_path)
+                img_data = None
+                file_hash = hashlib.md5(norm_path.encode('utf-8')).hexdigest()
+                cache_path = os.path.join(CACHE_DIR, f"{file_hash}.jpg")
+
+                if os.path.exists(cache_path):
+                    with open(cache_path, 'rb') as f:
+                        img_data = f.read()
+
+                if not img_data:
+                    if file_path.lower().endswith('.cbz'):
+                        with zipfile.ZipFile(file_path, 'r') as zf:
+                            image_files = [f for f in zf.namelist() if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                            image_files = [f for f in image_files if not f.endswith('/')]
+                            image_files.sort()
+                            if image_files:
+                                img_data = zf.read(image_files[0])
+                    elif file_path.lower().endswith('.cbr') and HAS_RAR:
+                        with rarfile.RarFile(file_path, 'r') as rf:
+                            image_files = [f for f in rf.namelist() if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                            image_files = [f for f in image_files if not f.endswith('/') and not f.endswith('\\')]
+                            image_files.sort()
+                            if image_files:
+                                img_data = rf.read(image_files[0])
+                    
+                    if img_data:
+                        try:
+                            with open(cache_path, 'wb') as f: f.write(img_data)
+                        except Exception: pass 
+
+                if img_data:
+                    self.cover_loaded.emit(norm_path, img_data)
+            except Exception: pass 
+
+    def stop(self):
+        self._is_running = False
+
+class ComicVineSearchThread(QThread):
+    results_ready = pyqtSignal(list)
+    def __init__(self, query):
+        super().__init__()
+        self.query = query
+
+    def run(self):
+        url = "https://comicvine.gamespot.com/api/search/"
+        params = {"api_key": COMIC_VINE_KEY, "format": "json", "query": self.query, "resources": "volume", "limit": 50}
+        try:
+            res = requests.get(url, params=params, headers={"User-Agent": "ComicVault/1.0"}).json()
+            results = res.get('results', [])
+            results.sort(key=lambda x: int(re.search(r'\d+', str(x.get('start_year', 9999))).group()) if re.search(r'\d+', str(x.get('start_year', 9999))) else 9999)
+            self.results_ready.emit(results)
+        except:
+            self.results_ready.emit([])
+
+class ComicVineIssueSearchThread(QThread):
+    results_ready = pyqtSignal(list)
+    def __init__(self, query):
+        super().__init__()
+        self.query = query
+
+    def run(self):
+        url = "https://comicvine.gamespot.com/api/search/"
+        params = {"api_key": COMIC_VINE_KEY, "format": "json", "query": self.query, "resources": "issue", "limit": 25}
+        try:
+            res = requests.get(url, params=params, headers={"User-Agent": "ComicVault/1.0"}).json()
+            self.results_ready.emit(res.get('results', []))
+        except:
+            self.results_ready.emit([])
+
+class ComicVineIssueThread(QThread):
+    issue_ready = pyqtSignal(dict)
+    def __init__(self, volume_id=None, issue_num=None, direct_api_url=None):
+        super().__init__()
+        self.volume_id = volume_id
+        self.issue_num = issue_num
+        self.direct_api_url = direct_api_url
+
+    def run(self):
+        if self.direct_api_url:
+            url = self.direct_api_url
+            params = {"api_key": COMIC_VINE_KEY, "format": "json"}
+        else:
+            url = "https://comicvine.gamespot.com/api/issues/"
+            params = {"api_key": COMIC_VINE_KEY, "format": "json", "filter": f"volume:{self.volume_id},issue_number:{self.issue_num}", "field_list": "name,deck,description,character_credits,person_credits,image"}
+        try:
+            res = requests.get(url, params=params, headers={"User-Agent": "ComicVault/1.0"}).json()
+            if self.direct_api_url:
+                data = res.get('results', {})
+            else:
+                data = res.get('results', [])[0] if res.get('results') else {}
+            self.issue_ready.emit(data)
+        except:
+            self.issue_ready.emit({})
+
+class ImageDownloadThread(QThread):
+    image_ready = pyqtSignal(bytes)
+    def __init__(self, url):
+        super().__init__()
+        self.url = url
+
+    def run(self):
+        try:
+            res = requests.get(self.url, headers={"User-Agent": "ComicVault/1.0"})
+            self.image_ready.emit(res.content)
+        except:
+            self.image_ready.emit(b"")
+
+class MetadataInjectorThread(QThread):
+    success = pyqtSignal(str, str) 
+    error = pyqtSignal(str)
+
+    def __init__(self, filepath, xml_string):
+        super().__init__()
+        self.filepath = filepath
+        self.xml_string = xml_string
+
+    def run(self):
+        target_dir = os.path.dirname(self.filepath)
+        base_name = os.path.basename(self.filepath)
+        name_no_ext, ext = os.path.splitext(base_name)
+        ext = ext.lower()
+
+        if ext == '.cbz':
+            has_xml = False
+            try:
+                with zipfile.ZipFile(self.filepath, 'r') as zf:
+                    if any(f.lower() == 'comicinfo.xml' for f in zf.namelist()):
+                        has_xml = True
+            except Exception: pass 
+
+            if not has_xml:
+                try:
+                    with zipfile.ZipFile(self.filepath, 'a', zipfile.ZIP_DEFLATED) as zf:
+                        zf.writestr('ComicInfo.xml', self.xml_string.encode('utf-8'))
+                    self.success.emit("Metadata appended instantly!", self.filepath)
+                    return 
+                except Exception: pass 
+
+            temp_path = os.path.join(target_dir, f".temp_{base_name}")
+            try:
+                with zipfile.ZipFile(self.filepath, 'r') as zin:
+                    with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+                        for item in zin.infolist():
+                            if item.filename.lower() != 'comicinfo.xml':
+                                zout.writestr(item, zin.read(item.filename))
+                        zout.writestr('ComicInfo.xml', self.xml_string.encode('utf-8'))
+                
+                for attempt in range(5):
+                    try:
+                        os.replace(temp_path, self.filepath)
+                        self.success.emit("Metadata rewritten successfully!", self.filepath)
+                        return 
+                    except PermissionError as e:
+                        if attempt < 4: time.sleep(0.5) 
+                        else: raise e 
+
+            except Exception as e:
+                if os.path.exists(temp_path): os.remove(temp_path)
+                self.error.emit(f"Failed to inject metadata:\n{e}")
+                return
+
+        elif ext == '.cbr':
+            new_cbz_path = os.path.join(target_dir, f"{name_no_ext}.cbz")
+            temp_path = os.path.join(target_dir, f".temp_{name_no_ext}.cbz")
+            
+            try:
+                with rarfile.RarFile(self.filepath, 'r') as rin:
+                    with zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
+                        for item in rin.infolist():
+                            if not item.isdir() and item.filename.lower() != 'comicinfo.xml':
+                                zout.writestr(item.filename, rin.read(item))
+                        zout.writestr('ComicInfo.xml', self.xml_string.encode('utf-8'))
+                
+                for attempt in range(5):
+                    try:
+                        os.replace(temp_path, new_cbz_path)
+                        try: os.remove(self.filepath) 
+                        except Exception: pass
+                        
+                        self.success.emit("Converted CBR to CBZ & Injected Metadata!", new_cbz_path)
+                        return
+                    except PermissionError as e:
+                        if attempt < 4: time.sleep(0.5)
+                        else: raise e
+            except Exception as e:
+                if os.path.exists(temp_path): os.remove(temp_path)
+                self.error.emit(f"Failed to convert CBR to CBZ:\n{e}")
+
+class GeminiSummaryThread(QThread):
+    summary_ready = pyqtSignal(str)
+    def __init__(self, issue_data, series_name, issue_num, alt_name=""):
+        super().__init__()
+        self.issue_data = issue_data
+        self.series_name = series_name
+        self.issue_num = issue_num
+        self.alt_name = alt_name
+        self.ai_client = genai.Client(api_key=GEMINI_KEY)
+
+    def run(self):
+        chars = ", ".join([c['name'] for c in (self.issue_data.get('character_credits') or [])])
+        plot = str(self.issue_data.get('deck') or self.issue_data.get('description') or "")[:5000]
+        needs_search = len(plot.strip()) < 50
+        base_title = self.series_name.split(' (')[0]
+        search_target = f"{base_title} {self.alt_name} issue {self.issue_num}" if self.alt_name else f"{self.series_name} issue {self.issue_num}"
+        
+        prompt = f"Expert comic historian. Write 500-800 word deep-dive into {self.series_name} #{self.issue_num}."
+        if needs_search:
+            prompt += f"\nUSE GOOGLE SEARCH for: '{search_target}'. Only summarize issue #{self.issue_num} specifically."
+        else:
+            prompt += f"\nPLOT: {plot}"
+        prompt += f"\nCharacters: {chars}\nHeadings: Context, Detailed Plot, Key Moments, Significance."
+
+        try:
+            from google.genai import types
+            cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())] if needs_search else None)
+            resp = self.ai_client.models.generate_content(model="gemini-2.5-flash", contents=prompt, config=cfg)
+            self.summary_ready.emit(resp.text)
+        except Exception as e:
+            self.summary_ready.emit(f"Error generating summary: {str(e)}")
+
+class GeminiChatThread(QThread):
+    response_ready = pyqtSignal(str)
+    error_occurred = pyqtSignal(str)
+    def __init__(self, context, history, user_input):
+        super().__init__()
+        self.context = context
+        self.history = history
+        self.user_input = user_input
+        self.ai_client = genai.Client(api_key=GEMINI_KEY)
+
+    def run(self):
+        sys_prompt = f"You are an expert comic historian answering questions. Use this context if relevant:\n{self.context if self.context else 'General comic knowledge.'}\n\n"
+        try:
+            prompt = sys_prompt + "\n".join([f"{msg['role']}: {msg['content']}" for msg in self.history])
+            prompt += f"\nuser: {self.user_input}\nassistant:"
+            resp = self.ai_client.models.generate_content(model="gemini-2.5-flash", contents=prompt)
+            self.response_ready.emit(resp.text)
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+class TTSWorkerThread(QThread):
+    audio_ready = pyqtSignal(bytes)
+    def __init__(self, text, voice):
+        super().__init__()
+        self.text = re.sub(r'[^a-zA-Z0-9\s.,!?]', '', text).strip()[:4000]
+        self.voice = voice
+
+    def run(self):
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            audio_data = loop.run_until_complete(self.generate_audio())
+            self.audio_ready.emit(audio_data)
+        except Exception:
+            self.audio_ready.emit(b"")
+
+    async def generate_audio(self):
+        communicate = edge_tts.Communicate(self.text, self.voice)
+        audio = b""
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio": 
+                audio += chunk["data"]
+        return audio
+
+class BatchProcessorThread(QThread):
+    progress_update = pyqtSignal(int, int)
+    log_update = pyqtSignal(str)
+    finished_batch = pyqtSignal(str)
+    def __init__(self, vol_id, vol_name, alt_name, start_issue, end_issue, output_dir):
+        super().__init__()
+        self.vol_id = vol_id
+        self.vol_name = vol_name
+        self.alt_name = alt_name
+        self.start_issue = start_issue
+        self.end_issue = end_issue
+        self.output_dir = output_dir
+        self._is_running = True
+        self.ai_client = genai.Client(api_key=GEMINI_KEY)
+
+    def run(self):
+        total = self.end_issue - self.start_issue + 1
+        for i, curr_issue in enumerate(range(self.start_issue, self.end_issue + 1)):
+            if not self._is_running: break
+            self.log_update.emit(f"Processing #{curr_issue}...")
+            
+            url = "https://comicvine.gamespot.com/api/issues/"
+            params = {"api_key": COMIC_VINE_KEY, "format": "json", "filter": f"volume:{self.vol_id},issue_number:{curr_issue}", "field_list": "name,deck,description,character_credits,person_credits,image"}
+            try:
+                res = requests.get(url, params=params, headers={"User-Agent": "ComicVault/1.0"}).json()
+                b_data = res.get('results', [])[0] if res.get('results') else None
+            except Exception as e:
+                self.log_update.emit(f"Error fetching #{curr_issue}: {e}")
+                continue
+
+            if not b_data:
+                self.log_update.emit(f"Issue #{curr_issue} not found. Skipping.")
+                self.progress_update.emit(i + 1, total)
+                continue
+
+            chars = ", ".join([c['name'] for c in (b_data.get('character_credits') or [])])
+            plot = str(b_data.get('deck') or b_data.get('description') or "")[:5000]
+            needs_search = len(plot.strip()) < 50
+            base_title = self.vol_name.split(' (')[0]
+            search_target = f"{base_title} {self.alt_name} issue {curr_issue}" if self.alt_name else f"{self.vol_name} issue {curr_issue}"
+            
+            prompt = f"Expert comic historian. Write 500-800 word deep-dive into {self.vol_name} #{curr_issue}."
+            if needs_search:
+                prompt += f"\nUSE GOOGLE SEARCH for: '{search_target}'. Only summarize issue #{curr_issue} specifically."
+            else:
+                prompt += f"\nPLOT: {plot}"
+            prompt += f"\nCharacters: {chars}\nHeadings: Context, Detailed Plot, Key Moments, Significance."
+
+            b_sum = "Error generating summary."
+            models = ["gemini-2.5-flash", "gemini-3.1-pro-preview"]
+            for m in models:
+                wait = 5
+                success = False
+                for att in range(2):
+                    if not self._is_running: break
+                    try:
+                        from google.genai import types
+                        cfg = types.GenerateContentConfig(tools=[types.Tool(google_search=types.GoogleSearch())] if needs_search else None)
+                        resp = self.ai_client.models.generate_content(model=m, contents=prompt, config=cfg)
+                        b_sum = resp.text
+                        success = True
+                        break
+                    except Exception:
+                        time.sleep(wait + random.uniform(1, 2))
+                        wait *= 2
+                if success: break
+
+            try:
+                cover_url = b_data.get('image', {}).get('medium_url')
+                title = f"{self.vol_name} #{curr_issue}"
+                
+                book = epub.EpubBook()
+                book.set_identifier(title.replace(" ", "_").replace("#", ""))
+                book.set_title(title)
+                book.set_language('en')
+                book.add_author("Comic Vault Analyzer")
+                
+                if cover_url:
+                    try:
+                        img_data = requests.get(cover_url).content
+                        book.set_cover("cover.jpg", img_data)
+                    except: pass
+                    
+                c1 = epub.EpubHtml(title=title, file_name='chap_01.xhtml', lang='en')
+                c1.content = f'<h2>{title}</h2>' + markdown.markdown(b_sum)
+                book.add_item(c1)
+                book.toc = (epub.Link('chap_01.xhtml', title, 'intro'),)
+                book.add_item(epub.EpubNcx())
+                book.add_item(epub.EpubNav())
+                book.spine = ['nav', c1]
+                
+                clean_vol = self.vol_name.replace(' ', '_').replace('/', '_')
+                out_path = os.path.join(self.output_dir, f"{clean_vol}_{curr_issue}.epub")
+                epub.write_epub(out_path, book)
+            except Exception as e:
+                self.log_update.emit(f"Error saving EPUB #{curr_issue}: {e}")
+
+            self.progress_update.emit(i + 1, total)
+            time.sleep(random.uniform(3, 5)) 
+
+        self.finished_batch.emit(self.output_dir)
+
+    def stop(self):
+        self._is_running = False
+
+# --- WIDGETS ---
+
+class MetadataMatchDialog(QDialog):
+    def __init__(self, filepath, local_pixmap):
+        super().__init__()
+        self.filepath = filepath
+        self.new_filepath = filepath 
+        
+        self.setWindowTitle("ComicVine Cover Matcher")
+        self.resize(800, 600)
+        self.setStyleSheet("""
+            QDialog { background-color: #282a36; color: #f8f8f2; }
+            QLabel { color: #f8f8f2; font-weight: bold; }
+            QLineEdit { background-color: #21222c; border: 1px solid #44475a; padding: 5px; color: #f8f8f2; }
+            QPushButton { background-color: #44475a; color: white; padding: 6px; border-radius: 3px; }
+            QPushButton:hover { background-color: #6272a4; }
+            QPushButton#save_btn { background-color: #50fa7b; color: #282a36; font-weight: bold; }
+            QListWidget { background-color: #21222c; border: 1px solid #44475a; color: white; }
+        """)
+
+        self.layout = QVBoxLayout(self)
+
+        self.h_layout = QHBoxLayout()
+        
+        self.local_vbox = QVBoxLayout()
+        self.local_vbox.addWidget(QLabel("Your Local Cover:"))
+        self.local_cover_label = QLabel()
+        self.local_cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.local_cover_label.setPixmap(local_pixmap.scaled(300, 450, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        self.local_vbox.addWidget(self.local_cover_label)
+        self.h_layout.addLayout(self.local_vbox)
+
+        self.center_vbox = QVBoxLayout()
+        self.center_vbox.addWidget(QLabel("Search ComicVine for Issue:"))
+        
+        search_hbox = QHBoxLayout()
+        self.search_input = QLineEdit()
+        base_name = os.path.splitext(os.path.basename(filepath))[0]
+        clean_name = re.sub(r'\(.*?\)|\[.*?\]', '', base_name).strip()
+        self.search_input.setText(clean_name)
+        
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self.perform_search)
+        search_hbox.addWidget(self.search_input)
+        search_hbox.addWidget(self.search_btn)
+        self.center_vbox.addLayout(search_hbox)
+
+        self.results_list = QListWidget()
+        self.results_list.itemClicked.connect(self.on_result_clicked)
+        self.center_vbox.addWidget(self.results_list)
+        self.h_layout.addLayout(self.center_vbox)
+
+        self.remote_vbox = QVBoxLayout()
+        self.remote_vbox.addWidget(QLabel("ComicVine Cover:"))
+        self.remote_cover_label = QLabel("Select an issue\nto view cover.")
+        self.remote_cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.remote_cover_label.setFixedSize(300, 450)
+        self.remote_vbox.addWidget(self.remote_cover_label)
+        self.h_layout.addLayout(self.remote_vbox)
+
+        self.layout.addLayout(self.h_layout)
+
+        self.save_btn = QPushButton("Inject Metadata into CBZ")
+        self.save_btn.setObjectName("save_btn")
+        self.save_btn.clicked.connect(self.inject_metadata)
+        self.save_btn.setEnabled(False)
+        self.layout.addWidget(self.save_btn)
+
+        self.current_results = []
+        self.selected_issue_data = None
+        self.search_thread = None
+        self.img_thread = None
+        self.issue_thread = None
+        self.injector_thread = None
+
+        QTimer.singleShot(200, self.perform_search)
+
+    def perform_search(self):
+        query = self.search_input.text().strip()
+        if not query: return
+        self.results_list.clear()
+        self.results_list.addItem("Searching...")
+        self.search_btn.setEnabled(False)
+        
+        self.search_thread = ComicVineIssueSearchThread(query)
+        self.search_thread.results_ready.connect(self.on_search_done)
+        self.search_thread.start()
+
+    def on_search_done(self, results):
+        self.search_btn.setEnabled(True)
+        self.results_list.clear()
+        self.current_results = results
+        
+        if not results:
+            self.results_list.addItem("No issues found.")
+            return
+
+        for issue in results:
+            vol_name = issue.get('volume', {}).get('name', 'Unknown Volume')
+            issue_num = issue.get('issue_number', '0')
+            name = issue.get('name', '')
+            display = f"{vol_name} #{issue_num}"
+            if name: display += f" - {name}"
+            self.results_list.addItem(display)
+
+    def on_result_clicked(self, item):
+        idx = self.results_list.row(item)
+        if idx < 0 or idx >= len(self.current_results): return
+        
+        issue_stub = self.current_results[idx]
+        img_url = issue_stub.get('image', {}).get('medium_url')
+        
+        self.remote_cover_label.setText("Loading cover...")
+        self.save_btn.setEnabled(False)
+
+        if img_url:
+            self.img_thread = ImageDownloadThread(img_url)
+            self.img_thread.image_ready.connect(self.on_image_downloaded)
+            self.img_thread.start()
+
+        api_url = issue_stub.get('api_detail_url')
+        if api_url:
+            self.issue_thread = ComicVineIssueThread(direct_api_url=api_url)
+            self.issue_thread.issue_ready.connect(self.on_full_data_ready)
+            self.issue_thread.start()
+
+    def on_image_downloaded(self, data):
+        if data:
+            pixmap = QPixmap()
+            pixmap.loadFromData(data)
+            self.remote_cover_label.setPixmap(pixmap.scaled(300, 450, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.remote_cover_label.setText("Image load failed.")
+
+    def on_full_data_ready(self, data):
+        self.selected_issue_data = data
+        ext = self.filepath.lower()
+        if ext.endswith('.cbz'):
+            self.save_btn.setText("Inject Metadata into CBZ")
+            self.save_btn.setEnabled(True)
+        elif ext.endswith('.cbr') and HAS_RAR:
+            self.save_btn.setText("Convert CBR to CBZ & Inject Metadata")
+            self.save_btn.setEnabled(True)
+        else:
+            self.save_btn.setText("Cannot Inject (Requires CBZ, or UnRAR for CBR)")
+            self.save_btn.setEnabled(False)
+
+    def build_xml(self):
+        data = self.selected_issue_data
+        
+        title = str(data.get("name") or "").replace("&", "&amp;").replace("<", "&lt;")
+        series = str(data.get("volume", {}).get("name") or "").replace("&", "&amp;").replace("<", "&lt;")
+        number = str(data.get("issue_number") or "")
+        
+        desc = data.get("deck") or data.get("description") or ""
+        desc = re.sub(r'<[^>]+>', '', desc).strip().replace("&", "&amp;").replace("<", "&lt;")
+
+        year, month = "", ""
+        date_str = data.get("cover_date") or ""
+        if date_str:
+            parts = date_str.split('-')
+            if len(parts) >= 1: year = parts[0]
+            if len(parts) >= 2: month = parts[1]
+
+        writers, artists = [], []
+        for person in data.get("person_credits", []):
+            roles = person.get("role", "").lower()
+            name = person.get("name", "").replace("&", "&amp;").replace("<", "&lt;")
+            if "writer" in roles: writers.append(name)
+            if "penciler" in roles or "artist" in roles: artists.append(name)
+            
+        writer_str = ", ".join(writers)
+        artist_str = ", ".join(artists)
+
+        xml = [
+            '<?xml version="1.0" encoding="utf-8"?>',
+            '<ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">',
+            f'  <Title>{title}</Title>' if title else '',
+            f'  <Series>{series}</Series>' if series else '',
+            f'  <Number>{number}</Number>' if number else '',
+            f'  <Summary>{desc}</Summary>' if desc else '',
+            f'  <Year>{year}</Year>' if year else '',
+            f'  <Month>{month}</Month>' if month else '',
+            f'  <Writer>{writer_str}</Writer>' if writer_str else '',
+            f'  <Penciller>{artist_str}</Penciller>' if artist_str else '',
+            '</ComicInfo>'
+        ]
+        return "\n".join(filter(None, xml))
+
+    def inject_metadata(self):
+        if not self.selected_issue_data: return
+        
+        xml_string = self.build_xml()
+        
+        self.save_btn.setEnabled(False)
+        self.save_btn.setText("Processing... Please wait.")
+        self.save_btn.setStyleSheet("background-color: #f1fa8c; color: #282a36;") 
+        
+        self.injector_thread = MetadataInjectorThread(self.filepath, xml_string)
+        self.injector_thread.success.connect(self.on_injection_success)
+        self.injector_thread.error.connect(self.on_injection_error)
+        self.injector_thread.start()
+
+    def on_injection_success(self, msg, new_filepath):
+        self.new_filepath = new_filepath 
+        QMessageBox.information(self, "Success", msg)
+        self.accept()
+
+    def on_injection_error(self, err_msg):
+        QMessageBox.critical(self, "Error", err_msg)
+        self.save_btn.setEnabled(True)
+        self.save_btn.setStyleSheet("background-color: #50fa7b; color: #282a36; font-weight: bold;")
+        self.on_full_data_ready(self.selected_issue_data) 
+
+
+class ComicFinderTab(QWidget):
+    analysis_completed = pyqtSignal(str, str)
+
+    def __init__(self):
+        super().__init__()
+        self.layout = QHBoxLayout(self)
+        self.layout.setContentsMargins(10, 10, 10, 10)
+        
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.layout.addWidget(self.splitter)
+        
+        self.controls_panel = QWidget()
+        self.controls_layout = QVBoxLayout(self.controls_panel)
+        
+        self.controls_layout.addWidget(QLabel("🔍 Comic Vine Search"))
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Enter Series Name...")
+        self.controls_layout.addWidget(self.search_input)
+        
+        self.search_btn = QPushButton("Search Volumes")
+        self.search_btn.clicked.connect(self.search_volumes)
+        self.controls_layout.addWidget(self.search_btn)
+        
+        self.volume_combo = QComboBox()
+        self.controls_layout.addWidget(self.volume_combo)
+        self.current_volumes = {} 
+        
+        issue_layout = QHBoxLayout()
+        self.prev_btn = QPushButton("◄")
+        self.prev_btn.setFixedWidth(30)
+        self.prev_btn.clicked.connect(self.prev_issue)
+        
+        self.issue_input = QLineEdit("1")
+        self.issue_input.setPlaceholderText("Issue #")
+        self.issue_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        self.next_btn = QPushButton("►")
+        self.next_btn.setFixedWidth(30)
+        self.next_btn.clicked.connect(self.next_issue)
+
+        issue_layout.addWidget(self.prev_btn)
+        issue_layout.addWidget(self.issue_input)
+        issue_layout.addWidget(self.next_btn)
+        
+        self.alt_name_input = QLineEdit()
+        self.alt_name_input.setPlaceholderText("Wiki/Vol Override")
+        
+        self.controls_layout.addWidget(QLabel("Issue Selection:"))
+        self.controls_layout.addLayout(issue_layout)
+        self.controls_layout.addWidget(self.alt_name_input)
+        
+        self.analyze_btn = QPushButton("Analyze Single Issue")
+        self.analyze_btn.clicked.connect(self.fetch_and_analyze)
+        self.controls_layout.addWidget(self.analyze_btn)
+        
+        self.controls_layout.addSpacing(15)
+        self.controls_layout.addWidget(QLabel("📦 Batch EPUB Processor"))
+        
+        batch_layout = QHBoxLayout()
+        self.batch_range_input = QLineEdit()
+        self.batch_range_input.setPlaceholderText("Range (e.g., 1-5)")
+        self.batch_start_btn = QPushButton("Start Batch")
+        self.batch_start_btn.clicked.connect(self.start_batch)
+        batch_layout.addWidget(self.batch_range_input)
+        batch_layout.addWidget(self.batch_start_btn)
+        self.controls_layout.addLayout(batch_layout)
+        
+        self.batch_progress = QProgressBar()
+        self.batch_progress.setValue(0)
+        self.batch_progress.setTextVisible(True)
+        self.controls_layout.addWidget(self.batch_progress)
+
+        self.controls_layout.addSpacing(15)
+        self.controls_layout.addWidget(QLabel("🎙️ Narrator Settings"))
+        self.voice_combo = QComboBox()
+        self.voices = {
+            "Christopher (Deep US Male)": "en-US-ChristopherNeural", 
+            "Aria (Clear US Female)": "en-US-AriaNeural",
+            "Guy (Energetic US Male)": "en-US-GuyNeural",
+            "Jenny (Standard US Female)": "en-US-JennyNeural",
+            "Steffan (Pro US Male)": "en-US-SteffanNeural",
+            "Ryan (British Male)": "en-GB-RyanNeural",
+            "Sonia (British Female)": "en-GB-SoniaNeural",
+            "Natasha (Australian Female)": "en-AU-NatashaNeural",
+            "William (Australian Male)": "en-AU-WilliamNeural"
+        }
+        self.voice_combo.addItems(list(self.voices.keys()))
+        self.controls_layout.addWidget(self.voice_combo)
+
+        speed_layout = QHBoxLayout()
+        self.speed_label = QLabel("Speed: 1.0x")
+        self.speed_label.setFixedWidth(65)
+        self.speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self.speed_slider.setRange(5, 20) 
+        self.speed_slider.setValue(10)    
+        self.speed_slider.valueChanged.connect(self.change_speed)
+        speed_layout.addWidget(self.speed_label)
+        speed_layout.addWidget(self.speed_slider)
+        self.controls_layout.addLayout(speed_layout)
+
+        self.audio_layout = QHBoxLayout()
+        self.play_btn = QPushButton("Play Audio")
+        self.play_btn.clicked.connect(self.play_audio)
+        self.stop_btn = QPushButton("Stop")
+        self.stop_btn.clicked.connect(self.stop_audio)
+        self.audio_layout.addWidget(self.play_btn)
+        self.audio_layout.addWidget(self.stop_btn)
+        self.controls_layout.addLayout(self.audio_layout)
+        
+        self.controls_layout.addStretch() 
+        
+        self.results_panel = QWidget()
+        self.results_layout = QVBoxLayout(self.results_panel)
+        
+        self.status_label = QLabel("Ready.")
+        self.status_label.setStyleSheet("color: #f1fa8c;")
+        self.results_layout.addWidget(self.status_label)
+        
+        self.summary_display = QTextBrowser()
+        self.summary_display.setOpenExternalLinks(False)
+        self.results_layout.addWidget(self.summary_display)
+        
+        self.export_epub_btn = QPushButton("📖 Export Single Summary as EPUB")
+        self.export_epub_btn.clicked.connect(self.export_epub)
+        self.export_epub_btn.setEnabled(False)
+        self.results_layout.addWidget(self.export_epub_btn)
+        
+        self.splitter.addWidget(self.controls_panel)
+        self.splitter.addWidget(self.results_panel)
+        self.splitter.setSizes([350, 650])
+        
+        self.current_issue_data = None
+        self.current_summary_text = None
+        self.current_title = None
+        self.audio_temp_file = os.path.join(CACHE_DIR, "temp_audio.mp3")
+        self.batch_thread = None
+        
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.player.setAudioOutput(self.audio_output)
+        self.audio_output.setVolume(1.0)
+
+    def change_speed(self, value):
+        speed = value / 10.0
+        self.speed_label.setText(f"Speed: {speed}x")
+        self.player.setPlaybackRate(speed)
+
+    def _get_issue_int(self):
+        try:
+            val = int(self.issue_input.text().strip())
+            return max(1, val)
+        except ValueError:
+            return 1
+
+    def prev_issue(self):
+        val = self._get_issue_int()
+        if val > 1:
+            self.issue_input.setText(str(val - 1))
+            if self.volume_combo.currentText():
+                self.fetch_and_analyze()
+
+    def next_issue(self):
+        val = self._get_issue_int()
+        self.issue_input.setText(str(val + 1))
+        if self.volume_combo.currentText():
+            self.fetch_and_analyze()
+
+    def search_volumes(self):
+        query = self.search_input.text()
+        if not query: return
+        self.status_label.setText("Searching Comic Vine...")
+        self.search_btn.setEnabled(False)
+        
+        self.search_thread = ComicVineSearchThread(query)
+        self.search_thread.results_ready.connect(self.on_volumes_found)
+        self.search_thread.start()
+
+    def on_volumes_found(self, results):
+        self.search_btn.setEnabled(True)
+        self.volume_combo.clear()
+        self.current_volumes.clear()
+        
+        if not results:
+            self.status_label.setText("No volumes found.")
+            return
+            
+        for v in results:
+            name = f"{v['name']} ({v.get('start_year', 'Unknown')})"
+            self.current_volumes[name] = v['id']
+            self.volume_combo.addItem(name)
+        self.status_label.setText(f"Found {len(results)} volumes.")
+
+    def fetch_and_analyze(self):
+        self.issue_input.setText(str(self._get_issue_int()))
+        
+        vol_name = self.volume_combo.currentText()
+        if not vol_name: return
+        
+        vol_id = self.current_volumes[vol_name]
+        issue_num = self.issue_input.text()
+        alt_name = self.alt_name_input.text()
+        self.current_title = f"{vol_name} #{issue_num}"
+        
+        self.status_label.setText(f"Fetching Issue {issue_num} data...")
+        self.analyze_btn.setEnabled(False)
+        self.prev_btn.setEnabled(False)
+        self.next_btn.setEnabled(False)
+        
+        self.issue_thread = ComicVineIssueThread(vol_id, issue_num)
+        self.issue_thread.issue_ready.connect(self.on_issue_data)
+        self.issue_thread.start()
+
+    def on_issue_data(self, data):
+        if not data:
+            self.status_label.setText("Issue not found on Comic Vine.")
+            self.analyze_btn.setEnabled(True)
+            self.prev_btn.setEnabled(True)
+            self.next_btn.setEnabled(True)
+            return
+            
+        self.current_issue_data = data
+        self.status_label.setText("Generating AI Summary...")
+        
+        vol_name = self.volume_combo.currentText().split(' (')[0]
+        issue_num = self.issue_input.text()
+        alt_name = self.alt_name_input.text()
+        
+        self.summary_thread = GeminiSummaryThread(data, vol_name, issue_num, alt_name)
+        self.summary_thread.summary_ready.connect(self.on_summary_ready)
+        self.summary_thread.start()
+
+    def on_summary_ready(self, summary_text):
+        self.current_summary_text = summary_text
+        html = markdown.markdown(summary_text)
+        self.summary_display.setHtml(f"<h2>{self.current_title}</h2>" + html)
+        self.export_epub_btn.setEnabled(True)
+        
+        self.analysis_completed.emit(self.current_title, summary_text)
+        
+        self.status_label.setText("Generating Audio TTS...")
+        voice_id = self.voices[self.voice_combo.currentText()]
+        
+        self.tts_thread = TTSWorkerThread(summary_text, voice_id)
+        self.tts_thread.audio_ready.connect(self.on_audio_ready)
+        self.tts_thread.start()
+
+    def on_audio_ready(self, audio_bytes):
+        self.analyze_btn.setEnabled(True)
+        self.prev_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
+        if audio_bytes:
+            with open(self.audio_temp_file, "wb") as f:
+                f.write(audio_bytes)
+            self.player.setSource(QUrl.fromLocalFile(os.path.abspath(self.audio_temp_file)))
+            self.status_label.setText("Analysis Complete. Audio Ready.")
+            self.player.setPlaybackRate(self.speed_slider.value() / 10.0) 
+        else:
+            self.status_label.setText("Analysis Complete. Audio Generation Failed.")
+
+    def play_audio(self):
+        if os.path.exists(self.audio_temp_file):
+            self.player.play()
+            
+    def stop_audio(self):
+        self.player.stop()
+
+    def export_epub(self):
+        if not self.current_summary_text: return
+        save_path, _ = QFileDialog.getSaveFileName(self, "Save EPUB", f"{self.current_title}.epub", "EPUB Files (*.epub)")
+        if not save_path: return
+        
+        cover_url = self.current_issue_data.get('image', {}).get('medium_url')
+        try:
+            book = epub.EpubBook()
+            book.set_identifier(self.current_title.replace(" ", "_").replace("#", ""))
+            book.set_title(self.current_title)
+            book.set_language('en')
+            book.add_author("Comic Vault Analyzer")
+            
+            if cover_url:
+                try:
+                    img_data = requests.get(cover_url).content
+                    book.set_cover("cover.jpg", img_data)
+                except: pass
+                
+            c1 = epub.EpubHtml(title=self.current_title, file_name='chap_01.xhtml', lang='en')
+            c1.content = f'<h2>{self.current_title}</h2>' + markdown.markdown(self.current_summary_text)
+            book.add_item(c1)
+            book.toc = (epub.Link('chap_01.xhtml', self.current_title, 'intro'),)
+            book.add_item(epub.EpubNcx())
+            book.add_item(epub.EpubNav())
+            book.spine = ['nav', c1]
+            
+            epub.write_epub(save_path, book)
+            QMessageBox.information(self, "Success", f"EPUB saved successfully to:\n{save_path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save EPUB:\n{str(e)}")
+
+    def start_batch(self):
+        b_range = self.batch_range_input.text()
+        vol_name = self.volume_combo.currentText()
+        if not vol_name or "-" not in b_range:
+            QMessageBox.warning(self, "Warning", "Please select a volume and format the range properly (e.g., 1-5).")
+            return
+            
+        try:
+            start_num, end_num = map(int, b_range.split('-'))
+        except ValueError:
+            QMessageBox.warning(self, "Warning", "Range must be two numbers separated by a hyphen.")
+            return
+
+        vol_id = self.current_volumes[vol_name]
+        alt_name = self.alt_name_input.text()
+
+        output_dir = QFileDialog.getExistingDirectory(self, "Select Folder to Save EPUBs")
+        if not output_dir: return
+
+        self.batch_start_btn.setEnabled(False)
+        self.batch_progress.setValue(0)
+        
+        self.batch_thread = BatchProcessorThread(vol_id, vol_name, alt_name, start_num, end_num, output_dir)
+        self.batch_thread.progress_update.connect(self.on_batch_progress)
+        self.batch_thread.log_update.connect(self.on_batch_log)
+        self.batch_thread.finished_batch.connect(self.on_batch_finished)
+        self.batch_thread.start()
+
+    def on_batch_progress(self, current, total):
+        percentage = int((current / total) * 100)
+        self.batch_progress.setValue(percentage)
+
+    def on_batch_log(self, message):
+        self.status_label.setText(f"Batch: {message}")
+        self.summary_display.append(f"<p style='color:#8be9fd;'>{message}</p>")
+
+    def on_batch_finished(self, folder_path):
+        self.batch_start_btn.setEnabled(True)
+        self.batch_progress.setValue(100)
+        self.status_label.setText("Batch processing complete!")
+        QMessageBox.information(self, "Batch Finished", f"All summaries successfully saved to:\n{folder_path}")
+
+class ComicChatTab(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(15, 15, 15, 15)
+        
+        self.header_label = QLabel("General Chat Mode")
+        self.header_label.setStyleSheet("color: #8be9fd; font-weight: bold; font-size: 16px;")
+        
+        self.clear_btn = QPushButton("🗑️ Clear Chat")
+        self.clear_btn.setFixedWidth(120)
+        self.clear_btn.clicked.connect(self.clear_chat)
+        
+        header_layout = QHBoxLayout()
+        header_layout.addWidget(self.header_label)
+        header_layout.addWidget(self.clear_btn)
+        self.layout.addLayout(header_layout)
+        
+        self.chat_display = QTextBrowser()
+        self.chat_display.setOpenExternalLinks(False)
+        self.layout.addWidget(self.chat_display)
+        
+        input_layout = QHBoxLayout()
+        self.chat_input = QLineEdit()
+        self.chat_input.setPlaceholderText("Ask the Interrogator about comics...")
+        self.chat_input.returnPressed.connect(self.send_message)
+        self.send_btn = QPushButton("Send")
+        self.send_btn.clicked.connect(self.send_message)
+        
+        input_layout.addWidget(self.chat_input)
+        input_layout.addWidget(self.send_btn)
+        self.layout.addLayout(input_layout)
+        
+        self.context_title = None
+        self.context_summary = None
+        self.history = []
+        self.chat_thread = None
+
+    def update_context(self, title, summary):
+        self.context_title = title
+        self.context_summary = summary
+        self.header_label.setText(f"Discussing: {title}")
+
+    def clear_chat(self):
+        self.history.clear()
+        self.chat_display.clear()
+
+    def send_message(self):
+        user_text = self.chat_input.text().strip()
+        if not user_text: return
+        
+        self.chat_input.clear()
+        self.history.append({"role": "user", "content": user_text})
+        self.append_chat_bubble("🦸 You", user_text, "#6272a4")
+        
+        self.send_btn.setEnabled(False)
+        
+        self.chat_thread = GeminiChatThread(self.context_summary, self.history.copy(), user_text)
+        self.chat_thread.response_ready.connect(self.on_response)
+        self.chat_thread.error_occurred.connect(self.on_error)
+        self.chat_thread.start()
+
+    def on_response(self, text):
+        self.history.append({"role": "assistant", "content": text})
+        self.append_chat_bubble("🤖 Interrogator", text, "#44475a")
+        self.send_btn.setEnabled(True)
+
+    def on_error(self, err):
+        self.append_chat_bubble("⚠️ Error", err, "#ff5555")
+        self.send_btn.setEnabled(True)
+
+    def append_chat_bubble(self, sender, text, color):
+        html = f"""
+        <div style="background-color: {color}; padding: 10px; margin-bottom: 15px; border-radius: 8px; border-left: 4px solid #8be9fd;">
+            <b style="color: #f8f8f2; font-size: 15px;">{sender}</b><br><br>
+            <span style="color: #f8f8f2; font-size: 14px;">{markdown.markdown(text)}</span>
+        </div><br>
+        """
+        self.chat_display.append(html)
+
+
+# --- MAIN APPLICATION (APP A SHELL) ---
+class ComicBrowser(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Comic Library & Vault Analyzer")
+        self.resize(1300, 850)
+
+        self.current_comic_path = None
+        self.libraries_file = "libraries.json"
+        self.reading_file = "reading_list.json"
+        self.reading_history = []
+        
+        self.cover_thread = None       
+        self.grid_items_map = {}       
+
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.setCentralWidget(self.splitter)
+
+        self.left_panel = QWidget()
+        self.left_layout = QVBoxLayout(self.left_panel)
+        self.left_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.left_tabs = QTabWidget()
+        self.left_tabs.setObjectName("left_tabs")
+
+        self.browse_tab = QWidget()
+        self.browse_layout = QVBoxLayout(self.browse_tab)
+        self.browse_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.lib_label = QLabel("Libraries")
+        self.lib_label.setStyleSheet("font-weight: bold; color: #8be9fd; padding-left: 5px;")
+        
+        self.lib_list = QListWidget()
+        self.lib_list.setMaximumHeight(100) 
+        self.lib_list.itemClicked.connect(self.on_library_clicked)
+
+        self.btn_layout = QHBoxLayout()
+        self.add_lib_btn = QPushButton("+ Add Folder")
+        self.remove_lib_btn = QPushButton("- Remove")
+        self.all_drives_btn = QPushButton("Show All Drives")
+        self.clear_cache_btn = QPushButton("Clear Cache")
+        self.clear_cache_btn.clicked.connect(self.clear_image_cache)
+        # And add it to the layout below:
+        self.btn_layout.addWidget(self.clear_cache_btn)
+        
+        self.add_lib_btn.clicked.connect(self.add_to_libraries)
+        self.remove_lib_btn.clicked.connect(self.remove_library)
+        self.all_drives_btn.clicked.connect(self.show_all_drives)
+
+        self.btn_layout.addWidget(self.add_lib_btn)
+        self.btn_layout.addWidget(self.remove_lib_btn)
+        self.btn_layout.addWidget(self.all_drives_btn)
+
+        self.search_bar = QLineEdit()
+        self.search_bar.setPlaceholderText("Search local comics...")
+        self.search_bar.textChanged.connect(self.on_search_changed)
+
+        self.model = QFileSystemModel()
+        self.model.setRootPath(QDir.rootPath())
+        self.model.setNameFilters(['*.cbz', '*.cbr'])
+        self.model.setNameFilterDisables(False) 
+
+        self.proxy_model = QSortFilterProxyModel()
+        self.proxy_model.setSourceModel(self.model)
+        self.proxy_model.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.proxy_model.setRecursiveFilteringEnabled(True)
+
+        self.tree = QTreeView()
+        self.tree.setModel(self.proxy_model) 
+        self.tree.setColumnHidden(1, True)
+        self.tree.setColumnHidden(2, True)
+        self.tree.setColumnHidden(3, True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.selectionModel().selectionChanged.connect(self.on_file_selected)
+
+        self.browse_layout.addWidget(self.lib_label)
+        self.browse_layout.addWidget(self.lib_list)
+        self.browse_layout.addLayout(self.btn_layout)
+        self.browse_layout.addWidget(self.search_bar)
+        self.browse_layout.addWidget(self.tree)
+
+        self.reading_tab = QWidget()
+        self.reading_layout = QVBoxLayout(self.reading_tab)
+        self.reading_layout.setContentsMargins(5, 5, 5, 5)
+
+        self.reading_list_widget = QListWidget()
+        self.reading_list_widget.setViewMode(QListWidget.ViewMode.ListMode)
+        self.reading_list_widget.setIconSize(QSize(50, 75))
+        self.reading_list_widget.setWordWrap(True)
+        self.reading_list_widget.itemClicked.connect(self.on_reading_item_clicked)
+        
+        # NEW: Context Menu setup for the Reading List
+        self.reading_list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.reading_list_widget.customContextMenuRequested.connect(self.show_reading_context_menu)
+        
+        self.reading_btn_layout = QHBoxLayout()
+        self.remove_single_read_btn = QPushButton("❌ Remove Selected")
+        self.remove_single_read_btn.clicked.connect(self.remove_selected_reading)
+        
+        self.clear_read_btn = QPushButton("🗑️ Clear All")
+        self.clear_read_btn.clicked.connect(self.clear_reading_history)
+
+        self.reading_btn_layout.addWidget(self.remove_single_read_btn)
+        self.reading_btn_layout.addWidget(self.clear_read_btn)
+
+        self.reading_layout.addWidget(self.reading_list_widget)
+        self.reading_layout.addLayout(self.reading_btn_layout)
+
+        self.left_tabs.addTab(self.browse_tab, "Library")
+        self.left_tabs.addTab(self.reading_tab, "Reading")
+        self.left_layout.addWidget(self.left_tabs)
+
+        self.tabs = QTabWidget()
+        
+        self.details_tab = QWidget()
+        self.details_layout = QVBoxLayout(self.details_tab)
+        self.details_layout.setContentsMargins(15, 15, 15, 15) 
+        
+        self.cover_label = QLabel("Select a local comic file to view details.")
+        self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_label.setMinimumHeight(380) 
+
+        self.info_box = QTextBrowser()
+        
+        self.local_nav_layout = QHBoxLayout()
+        self.prev_local_btn = QPushButton("◄ Previous")
+        self.next_local_btn = QPushButton("Next ►")
+        self.prev_local_btn.setMinimumHeight(35)
+        self.next_local_btn.setMinimumHeight(35)
+        self.prev_local_btn.clicked.connect(self.prev_local_comic)
+        self.next_local_btn.clicked.connect(self.next_local_comic)
+        self.prev_local_btn.setEnabled(False)
+        self.next_local_btn.setEnabled(False)
+        
+        self.local_nav_layout.addWidget(self.prev_local_btn)
+        self.local_nav_layout.addWidget(self.next_local_btn)
+
+        self.read_btn = QPushButton("Read Comic in YACReader")
+        self.read_btn.setMinimumHeight(45)
+        self.read_btn.clicked.connect(self.open_in_reader)
+
+        self.action_btn = QPushButton("Convert & 🏷 ️Tag CBZ (Ctrl+Enter)")
+        self.action_btn.setMinimumHeight(40)
+        self.action_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.action_btn.clicked.connect(self.process_comic)
+        self.action_btn.setEnabled(False)
+
+        # --- NEW PROGRESS BAR ---
+        from PyQt6.QtWidgets import QProgressBar
+        self.convert_progress = QProgressBar()
+        self.convert_progress.setValue(0)
+        self.convert_progress.setTextVisible(True)
+        self.convert_progress.setVisible(False) # Hide it until we click Convert
+
+        # Make sure to swap self.scrape_btn with self.action_btn in the layout!
+        self.details_layout.addWidget(self.action_btn)
+        self.action_btn.setMinimumHeight(35)
+        self.action_btn.clicked.connect(self.open_scraper_dialog)
+        self.action_btn.setEnabled(False)
+
+        self.details_layout.addWidget(self.cover_label)
+        self.details_layout.addWidget(self.info_box)
+        self.details_layout.addLayout(self.local_nav_layout)
+        self.details_layout.addWidget(self.read_btn)
+        self.details_layout.addWidget(self.action_btn)
+
+        self.grid_tab = QWidget()
+        self.grid_layout = QVBoxLayout(self.grid_tab)
+        self.grid_list = QListWidget()
+        self.grid_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.grid_list.setIconSize(QSize(180, 270)) 
+        self.grid_list.setGridSize(QSize(220, 310)) 
+        self.grid_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.grid_list.itemClicked.connect(self.on_grid_item_clicked)
+        self.grid_layout.addWidget(self.grid_list)
+
+        self.finder_tab = ComicFinderTab()
+        self.chat_tab = ComicChatTab()
+        self.finder_tab.analysis_completed.connect(self.chat_tab.update_context)
+
+        self.tabs.addTab(self.details_tab, "Local Details")
+        self.tabs.addTab(self.grid_tab, "Local Grid")
+        self.tabs.addTab(self.finder_tab, "Comic Finder") 
+        self.tabs.addTab(self.chat_tab, "Comic Chat") 
+
+        self.splitter.addWidget(self.left_panel)
+        self.splitter.addWidget(self.tabs)
+        self.splitter.setSizes([350, 950]) 
+        from PyQt6.QtGui import QShortcut, QKeySequence
+        self.shortcut_action = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.shortcut_action.activated.connect(self.process_comic)
+        self.apply_dark_theme()
+        self.load_libraries()
+        self.load_reading_history()
+
+    # --- READING HISTORY LOGIC ---
+    def load_reading_history(self):
+        if os.path.exists(self.reading_file):
+            try:
+                with open(self.reading_file, 'r') as f:
+                    self.reading_history = json.load(f)
+            except Exception: pass
+        self.refresh_reading_ui()
+
+    def save_reading_history(self):
+        with open(self.reading_file, 'w') as f:
+            json.dump(self.reading_history, f)
+
+    def add_to_reading_list(self, path):
+        norm_path = os.path.normpath(path)
+        if norm_path in self.reading_history:
+            self.reading_history.remove(norm_path)
+        
+        self.reading_history.insert(0, norm_path)
+        self.save_reading_history()
+        self.refresh_reading_ui()
+
+    def remove_selected_reading(self):
+        current_item = self.reading_list_widget.currentItem()
+        if current_item:
+            file_path = os.path.normpath(current_item.data(Qt.ItemDataRole.UserRole))
+            if file_path in self.reading_history:
+                self.reading_history.remove(file_path)
+                self.save_reading_history()
+                self.refresh_reading_ui()
+
+    def show_reading_context_menu(self, pos):
+        item = self.reading_list_widget.itemAt(pos)
+        if item:
+            menu = QMenu()
+            menu.setStyleSheet("""
+                QMenu { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; } 
+                QMenu::item:selected { background-color: #44475a; }
+            """)
+            remove_action = menu.addAction("❌ Remove from Reading List")
+            action = menu.exec(self.reading_list_widget.mapToGlobal(pos))
+            if action == remove_action:
+                file_path = os.path.normpath(item.data(Qt.ItemDataRole.UserRole))
+                if file_path in self.reading_history:
+                    self.reading_history.remove(file_path)
+                    self.save_reading_history()
+                    self.refresh_reading_ui()
+
+    def clear_reading_history(self):
+        self.reading_history.clear()
+        self.save_reading_history()
+        self.refresh_reading_ui()
+
+    def refresh_reading_ui(self):
+        self.reading_list_widget.clear()
+        for path in self.reading_history:
+            if not os.path.exists(path):
+                continue 
+            
+            norm_path = os.path.normpath(path)
+            
+            filename = os.path.splitext(os.path.basename(norm_path))[0]
+            item = QListWidgetItem(filename)
+            item.setData(Qt.ItemDataRole.UserRole, norm_path)
+            
+            file_hash = hashlib.md5(norm_path.encode('utf-8')).hexdigest()
+            cache_path = os.path.join(CACHE_DIR, f"{file_hash}.jpg")
+            if os.path.exists(cache_path):
+                pixmap = QPixmap(cache_path)
+                scaled = pixmap.scaled(50, 75, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                item.setIcon(QIcon(scaled))
+                
+            self.reading_list_widget.addItem(item)
+
+    def on_reading_item_clicked(self, item):
+        file_path = os.path.normpath(item.data(Qt.ItemDataRole.UserRole))
+        if file_path:
+            self.tabs.setCurrentIndex(0) 
+            self.current_comic_path = file_path
+            self.load_comic_data(file_path)
+
+    # --- UNIVERSAL NAVIGATION LOGIC ---
+    def get_current_comic_list(self):
+        current_norm = os.path.normpath(self.current_comic_path) if self.current_comic_path else ""
+
+        paths = []
+        for i in range(self.grid_list.count()):
+            grid_path = self.grid_list.item(i).data(Qt.ItemDataRole.UserRole)
+            paths.append(os.path.normpath(grid_path))
+            
+        if current_norm in paths:
+            return paths
+
+        if self.current_comic_path:
+            directory = os.path.dirname(self.current_comic_path)
+            try:
+                def natural_sort_key(s):
+                    return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', os.path.basename(s))]
+                
+                files = os.listdir(directory)
+                valid_files = [os.path.normpath(os.path.join(directory, f)) for f in files if f.lower().endswith(('.cbz', '.cbr'))]
+                valid_files.sort(key=natural_sort_key)
+                return valid_files
+            except Exception: pass
+            
+        return []
+
+    def update_local_nav_buttons(self):
+        if not self.current_comic_path:
+            self.prev_local_btn.setEnabled(False)
+            self.next_local_btn.setEnabled(False)
+            return
+
+        current_norm = os.path.normpath(self.current_comic_path)
+        paths = self.get_current_comic_list()
+        
+        if current_norm in paths:
+            idx = paths.index(current_norm)
+            self.prev_local_btn.setEnabled(idx > 0)
+            self.next_local_btn.setEnabled(idx < len(paths) - 1)
+        else:
+            self.prev_local_btn.setEnabled(False)
+            self.next_local_btn.setEnabled(False)
+
+    def prev_local_comic(self):
+        current_norm = os.path.normpath(self.current_comic_path)
+        paths = self.get_current_comic_list()
+        if current_norm in paths:
+            idx = paths.index(current_norm)
+            if idx > 0:
+                new_path = paths[idx - 1]
+                self.current_comic_path = new_path
+                self.load_comic_data(new_path)
+
+    def next_local_comic(self):
+        current_norm = os.path.normpath(self.current_comic_path)
+        paths = self.get_current_comic_list()
+        if current_norm in paths:
+            idx = paths.index(current_norm)
+            if idx < len(paths) - 1:
+                new_path = paths[idx + 1]
+                self.current_comic_path = new_path
+                self.load_comic_data(new_path)
+
+    def open_scraper_dialog(self):
+        if not self.current_comic_path: return
+        dialog = MetadataMatchDialog(self.current_comic_path, self.cover_label.pixmap())
+        if dialog.exec():
+            if hasattr(dialog, 'new_filepath') and dialog.new_filepath:
+                self.current_comic_path = os.path.normpath(dialog.new_filepath)
+            self.load_comic_data(self.current_comic_path)
+
+    def on_search_changed(self, text):
+        self.proxy_model.setFilterFixedString(text)
+        search_text = text.lower()
+        for i in range(self.grid_list.count()):
+            item = self.grid_list.item(i)
+            item.setHidden(search_text not in item.text().lower())
+
+    def load_libraries(self):
+        if os.path.exists(self.libraries_file):
+            try:
+                with open(self.libraries_file, 'r') as f:
+                    paths = json.load(f)
+                    for path in paths:
+                        self.lib_list.addItem(path)
+            except Exception: pass 
+
+    def save_libraries(self):
+        paths = [self.lib_list.item(i).text() for i in range(self.lib_list.count())]
+        with open(self.libraries_file, 'w') as f:
+            json.dump(paths, f)
+
+    def add_to_libraries(self):
+        idx = self.tree.currentIndex()
+        source_idx = self.proxy_model.mapToSource(idx) 
+        if source_idx.isValid() and self.model.isDir(source_idx):
+            path = self.model.filePath(source_idx)
+            if path not in [self.lib_list.item(i).text() for i in range(self.lib_list.count())]:
+                self.lib_list.addItem(path)
+                self.save_libraries()
+
+    def remove_library(self):
+        current_item = self.lib_list.currentItem()
+        if current_item:
+            self.lib_list.takeItem(self.lib_list.row(current_item))
+            self.save_libraries()
+
+    def on_library_clicked(self, item):
+        path = item.text()
+        idx = self.model.index(path)
+        proxy_idx = self.proxy_model.mapFromSource(idx) 
+        self.tree.setRootIndex(proxy_idx)
+        self.tabs.setCurrentIndex(1)
+        self.load_folder_grid(path)
+        self.current_comic_path = None
+        self.action_btn.setEnabled(False)
+        self.update_local_nav_buttons()
+
+    def show_all_drives(self):
+        idx = self.model.index("")
+        proxy_idx = self.proxy_model.mapFromSource(idx)
+        self.tree.setRootIndex(proxy_idx)
+
+    def open_in_reader(self):
+        if self.current_comic_path:
+            self.add_to_reading_list(self.current_comic_path)
+            yac_path = r"C:\Program Files\YACReader\YACReader.exe" 
+            try:
+                subprocess.Popen([yac_path, self.current_comic_path])
+            except FileNotFoundError:
+                os.startfile(self.current_comic_path)
+
+    def keyPressEvent(self, event):
+        # Tree expansion logic
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.tree.hasFocus():
+                index = self.tree.currentIndex()
+                source_index = self.proxy_model.mapToSource(index)
+                if source_index.isValid() and self.model.isDir(source_index):
+                    self.tree.setExpanded(index, not self.tree.isExpanded(index))
+        # NEW: Delete key logic for Reading List
+        elif event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if self.reading_list_widget.hasFocus():
+                self.remove_selected_reading()
+                
+        super().keyPressEvent(event)
+
+    def on_file_selected(self, selected, deselected):
+        indexes = selected.indexes()
+        if not indexes: return
+        
+        source_index = self.proxy_model.mapToSource(indexes[0])
+        
+        file_path = os.path.normpath(self.model.filePath(source_index))
+        file_info = self.model.fileInfo(source_index)
+        
+        if file_info.isDir():
+            self.tabs.setCurrentIndex(1)
+            self.load_folder_grid(file_path)
+            self.current_comic_path = None
+            self.action_btn.setEnabled(False)
+            self.update_local_nav_buttons()
+            return
+
+        self.tabs.setCurrentIndex(0) 
+        if file_path.lower().endswith(('.cbz', '.cbr')):
+            self.current_comic_path = file_path 
+            if file_path.lower().endswith('.cbr') and not HAS_RAR:
+                self.cover_label.clear()
+                self.info_box.setHtml("<h3 style='color: #ff5555;'>Error: 'rarfile' missing</h3>")
+                self.action_btn.setEnabled(False)
+                self.update_local_nav_buttons()
+                return
+            self.load_comic_data(file_path)
+        else:
+            self.current_comic_path = None
+            self.action.btn.setEnabled(False)
+            self.update_local_nav_buttons()
+
+    def on_grid_item_clicked(self, item):
+        file_path = os.path.normpath(item.data(Qt.ItemDataRole.UserRole))
+        if file_path:
+            self.tabs.setCurrentIndex(0) 
+            self.current_comic_path = file_path
+            self.load_comic_data(file_path)
+            
+    def process_comic(self):
+        if not self.current_comic_path: return
+        
+        filename = os.path.basename(self.current_comic_path)
+        self.action_btn.setEnabled(False)
+        self.action_btn.setText("Starting conversion...")
+        
+        # Show and reset the progress bar
+        self.convert_progress.setVisible(True)
+        self.convert_progress.setValue(0)
+        
+        self.info_box.setHtml(f"<h3 style='color: #8be9fd;'>Extracting, Tagging, and Zipping {filename}...</h3>")
+        
+        xml_string = f"""<?xml version="1.0" encoding="utf-8"?>
+        <ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+          <Title>{os.path.splitext(filename)[0]}</Title>
+          <Summary>Summary goes here.</Summary>
+        </ComicInfo>"""
+
+        self.conversion_thread = ComicConverterThread(self.current_comic_path, xml_string)
+        
+        # Connect the new progress signals!
+        self.conversion_thread.progress_update.connect(self.update_convert_progress)
+        self.conversion_thread.status_update.connect(self.update_convert_status)
+        self.conversion_thread.finished_conversion.connect(self.on_conversion_complete)
+        
+        self.conversion_thread.start()
+
+    # --- NEW PROGRESS HANDLERS ---
+    def update_convert_progress(self, current, total):
+        if total > 0:
+            percentage = int((current / total) * 100)
+            self.convert_progress.setValue(percentage)
+
+    def update_convert_status(self, msg):
+        self.action_btn.setText(msg)
+    # -----------------------------
+
+    def on_conversion_complete(self, success, message, new_path):
+        self.action_btn.setEnabled(True)
+        self.action_btn.setText("Convert & Tag CBZ (Ctrl+Enter)")
+        self.convert_progress.setVisible(False) # Hide progress bar when done
+        
+        if success:
+            self.current_comic_path = new_path
+            self.load_comic_data(new_path)
+            self.info_box.append(f"<h3 style='color: #50fa7b;'>{message}</h3>")
+        else:
+            self.info_box.setHtml(f"<h3 style='color: #ff5555;'>{message}</h3>")
+        
+        # We need to construct the XML string here to pass to the thread
+        # For now, it uses a generic string, but you can plug your Gemini summary in here!
+        xml_string = f"""<?xml version="1.0" encoding="utf-8"?>
+        <ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+          <Title>{os.path.splitext(filename)[0]}</Title>
+          <Summary>Summary goes here.</Summary>
+        </ComicInfo>"""
+
+        self.conversion_thread = ComicConverterThread(self.current_comic_path, xml_string)
+        self.conversion_thread.finished_conversion.connect(self.on_conversion_complete)
+        self.conversion_thread.start()
+
+    def on_conversion_complete(self, success, message, new_path):
+        self.action_btn.setEnabled(True)
+        self.action_btn.setText("Convert & Tag CBZ (Ctrl+Enter)")
+        
+        if success:
+            self.current_comic_path = new_path
+            self.load_comic_data(new_path)
+            self.info_box.append(f"<h3 style='color: #50fa7b;'>{message}</h3>")
+        else:
+            self.info_box.setHtml(f"<h3 style='color: #ff5555;'>{message}</h3>")
+
+    def clear_image_cache(self):
+        if os.path.exists(CACHE_DIR):
+            import shutil
+            shutil.rmtree(CACHE_DIR)
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            self.info_box.setHtml("<h3 style='color: #ff5555;'>Image cache cleared!</h3>")        
+
+    def load_folder_grid(self, folder_path):
+        self.grid_list.clear()
+        self.grid_items_map.clear()
+        if self.cover_thread and self.cover_thread.isRunning():
+            self.cover_thread.stop()
+            self.cover_thread.wait()
+
+        comic_files = []
+        self.grid_list.setUpdatesEnabled(False)
+        try:
+            for file in os.listdir(folder_path):
+                if file.lower().endswith(('.cbz', '.cbr')):
+                    full_path = os.path.normpath(os.path.join(folder_path, file))
+                    comic_files.append(full_path)
+                    filename_only, _ = os.path.splitext(file)
+                    item = QListWidgetItem(filename_only)
+                    item.setData(Qt.ItemDataRole.UserRole, full_path) 
+                    self.grid_list.addItem(item)
+                    self.grid_items_map[full_path] = item 
+        except PermissionError: pass 
+        self.grid_list.setUpdatesEnabled(True)
+
+        if comic_files:
+            self.cover_thread = CoverLoaderThread(comic_files)
+            self.cover_thread.cover_loaded.connect(self.update_grid_icon)
+            self.cover_thread.start()
+
+    def update_grid_icon(self, file_path, img_data):
+        file_path = os.path.normpath(file_path)
+        if file_path in self.grid_items_map:
+            pixmap = QPixmap()
+            pixmap.loadFromData(img_data)
+            scaled = pixmap.scaled(180, 270, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            icon = QIcon(scaled)
+            self.grid_items_map[file_path].setIcon(icon)
+
+    def load_comic_data(self, file_path):
+        file_path = os.path.normpath(file_path)
+        self.action_btn.setEnabled(True)
+        self.update_local_nav_buttons() 
+        try:
+            file_hash = hashlib.md5(file_path.encode('utf-8')).hexdigest()
+            cache_path = os.path.join(CACHE_DIR, f"{file_hash}.jpg")
+            img_data = None
+
+            if os.path.exists(cache_path):
+                with open(cache_path, 'rb') as f:
+                    img_data = f.read()
+
+            if file_path.lower().endswith('.cbz'):
+                archive = zipfile.ZipFile(file_path, 'r')
+            else:
+                archive = rarfile.RarFile(file_path, 'r')
+
+            with archive as af:
+                file_list = af.namelist()
+                if not img_data:
+                    image_files = [f for f in file_list if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+                    image_files = [f for f in image_files if not f.endswith('/') and not f.endswith('\\')]
+                    image_files.sort()
+                    if image_files:
+                        img_data = af.read(image_files[0])
+                        try:
+                            with open(cache_path, 'wb') as f: f.write(img_data)
+                        except Exception: pass
+                
+                if img_data:
+                    pixmap = QPixmap()
+                    pixmap.loadFromData(img_data)
+                    scaled_pixmap = pixmap.scaled(250, 380, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                    self.cover_label.setPixmap(scaled_pixmap)
+                else:
+                    self.cover_label.setText("No images found.")
+
+                raw_filename = os.path.basename(file_path)
+                filename_only, _ = os.path.splitext(raw_filename)
+                xml_filename = next((f for f in file_list if f.lower() == 'comicinfo.xml'), None)
+                
+                if xml_filename:
+                    xml_data = af.read(xml_filename)
+                    xml_str = xml_data.decode('utf-8', errors='ignore')
+                    xml_str = re.sub(r'\sxmlns="[^"]+"', '', xml_str, count=1)
+                    
+                    root = ET.fromstring(xml_str)
+                    title = root.findtext('Title', 'Unknown Title')
+                    writer = root.findtext('Writer', 'Unknown Writer')
+                    artist = root.findtext('Penciller', root.findtext('Artist', 'Unknown Artist'))
+                    summary = root.findtext('Summary', 'No summary available.')
+                    
+                    html_content = f"""
+                        <h3 style="color: #50fa7b; font-size: 14px;"><i>{filename_only}</i></h3>
+                        <h2 style="color: #50fa7b;">{title}</h2>
+                        <div><b>Writer:</b> {writer}</div>
+                        <div><b>Artist:</b> {artist}</div>
+                        <hr><div>{summary}</div>
+                    """
+                    self.info_box.setHtml(html_content)
+                else:
+                    self.info_box.setHtml(f"<h3><i>{filename_only}</i></h3><h3 style='color:#f1fa8c;'>No Metadata found.</h3>")
+
+        except Exception as e:
+            self.info_box.setHtml(f"<p style='color: #ff5555;'>Error reading file: {e}</p>")
+
+    def apply_dark_theme(self):
+        self.setStyleSheet("""
+            QMainWindow { background-color: #282a36; }
+            QWidget { color: #f8f8f2; }
+            
+            QTreeView, QListWidget, QTextBrowser { 
+                background-color: #21222c; 
+                border: 1px solid #44475a; 
+            }
+            
+            QHeaderView::section {
+                background-color: #282a36;
+                color: #f8f8f2;
+                padding: 5px;
+                border: 1px solid #44475a;
+            }
+            
+            QPushButton { background-color: #44475a; padding: 5px; border-radius: 3px; }
+            QPushButton:hover { background-color: #6272a4; }
+            QPushButton#read_btn { background-color: #50fa7b; color: #282a36; font-weight: bold; }
+            
+            QLineEdit, QComboBox { 
+                background-color: #21222c; 
+                border: 1px solid #44475a; 
+                padding: 5px; 
+            }
+            QComboBox QAbstractItemView {
+                background-color: #282a36;
+                color: #f8f8f2;
+                selection-background-color: #44475a;
+            }
+            
+            QProgressBar {
+                background-color: #282a36; 
+                border: 1px solid #44475a;
+                border-radius: 4px;
+                text-align: center;
+                color: #f8f8f2;
+            }
+            QProgressBar::chunk { background-color: #50fa7b; border-radius: 3px; }
+            
+            QTabWidget::pane { border: 1px solid #44475a; background: #282a36; }
+            QTabBar::tab { background: #21222c; padding: 8px 15px; border: 1px solid #44475a; }
+            QTabBar::tab:selected { background: #44475a; font-weight: bold; }
+            
+            QTabWidget#left_tabs > QTabBar::tab { padding: 8px 10px; width: 150px; }
+            
+            QSlider::groove:horizontal {
+                border: 1px solid #44475a;
+                height: 8px;
+                background: #282a36;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #50fa7b;
+                border: 1px solid #44475a;
+                width: 14px;
+                margin: -4px 0;
+                border-radius: 7px;
+            }
+            
+            QScrollBar:vertical {
+                border: none;
+                background: #282a36;
+                width: 14px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #6272a4;
+                border-radius: 7px;
+                min-height: 20px;
+            }
+            QScrollBar::handle:vertical:hover { background: #50fa7b; }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            
+            QScrollBar:horizontal {
+                border: none;
+                background: #282a36;
+                height: 14px;
+                margin: 0px 0px 0px 0px;
+            }
+            QScrollBar::handle:horizontal {
+                background: #6272a4;
+                border-radius: 7px;
+                min-width: 20px;
+            }
+            QScrollBar::handle:horizontal:hover { background: #50fa7b; }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
+            
+            QSplitter::handle {
+                background-color: #44475a;
+                margin: 2px;
+                border-radius: 2px;
+            }
+            QSplitter::handle:hover {
+                background-color: #8be9fd;
+            }
+        """)
+        self.read_btn.setObjectName("read_btn")
+
+if __name__ == '__main__':
+    app = QApplication(sys.argv)
+    window = ComicBrowser()
+    window.show()
+    sys.exit(app.exec())
