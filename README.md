@@ -3,19 +3,20 @@
 An AI-Powered Local Comic Book Librarian & Reader
 
 Welcome to Your Comics!, a comprehensive, locally-hosted desktop application built in Python and PyQt6. This app is designed to be the ultimate hub for organizing, reading, and exploring your comic book collection. It combines local file management with powerful integrations like the Comic Vine API and Google's Gemini AI to act as your personal comic book historian and assistant.
-✨ Key Features
 
-    📚 Local Library Management: Browse your local comic files using a sleek dark-mode directory tree. View high-res covers and metadata in the Details tab, or browse your collection visually in the Grid tab.
+✨ Key Features:
 
-    🤖 "The Interrogator" AI Chat: Chat directly with an embedded Gemini AI assistant about any comic in your library. Ask for lore, backstory, or character histories, and have the answers read aloud to you using integrated Text-to-Speech (TTS).
+📚 Local Library Management: Browse your local comic files using a sleek dark-mode directory tree. View high-res covers and metadata in the Details tab, or browse your collection visually in the Grid tab.
 
-    🎙️ Voiced Summaries: Use the Comic Finder to pull metadata from Comic Vine, generate AI summaries, and listen to an audio briefing. Includes full media controls (Play, Pause, Stop) and customizable voice/speed settings.
+🤖 "The Interrogator" AI Chat: Chat directly with an embedded Gemini AI assistant about any comic in your library. Ask for lore, backstory, or character histories, and have the answers read aloud to you using integrated Text-to-Speech      (TTS).
 
-    🌐 Built-In Web Browser: A fully functional Chromium-based web browser locked to getcomics.info. Download comics directly into your library with a built-in download manager and progress tracker.
+🎙️ Voiced Summaries: Use the Comic Finder to pull metadata from Comic Vine, generate AI summaries, and listen to an audio briefing. Includes full media controls (Play, Pause, Stop) and customizable voice/speed settings.
 
-    📖 External Reader Integration: Launch comics instantly in your preferred desktop reader (like YACReader) with a single keystroke (Ctrl+Enter).
+🌐 Built-In Web Browser: A fully functional Chromium-based web browser locked to getcomics.info. Download comics directly into your library with a built-in download manager and progress tracker
 
-    ⚙️ UI-Driven Settings: No need to hardcode API keys! Manage your Comic Vine API key, Gemini API key, AI voice preferences, and .exe reader paths directly from the Settings tab.
+📖 External Reader Integration: Launch comics instantly in your preferred desktop reader (like YACReader).
+
+⚙️ UI-Driven Settings: No need to hardcode API keys! Manage your Comic Vine API key, Gemini API key, AI voice preferences, and .exe reader paths directly from the Settings tab.
 
 🛠️ Prerequisites & Setup
 
