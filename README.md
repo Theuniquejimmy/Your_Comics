@@ -63,14 +63,14 @@ Navigating the App:
 If you want to turn this Python script into a native Windows application that you can double-click without opening a terminal, package it using PyInstaller:
 
     Install PyInstaller:
-    Bash
 
     pip install pyinstaller
 
     Build the app (this hides the background console and bundles everything into one file):
+
+    pyinstaller --noconsole --onefile yourcomics.py
     Bash
 
-Or just downlaod me ready made exe!
-    pyinstaller --noconsole --onefile yourcomics.py
-
     Your fully compiled yourcomics.exe will be waiting for you inside the newly created dist folder!
+
+    Or just downlaod me ready made exe!
