@@ -1,6 +1,3 @@
-This application has grown into an absolute powerhouse. You went from a basic file viewer to a fully automated, AI-driven, converting, tagging, and downloading local librarian.
-
-Here is your fully updated, professional README.md that includes every new feature, requirement, and UI addition we just built. You can copy and paste this directly into your project!
 🦸 Your Comics!
 
 An AI-Powered Local Comic Book Librarian, Tagger, & Reader
