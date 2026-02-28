@@ -3,7 +3,8 @@
 An AI-Powered Local Comic Book Librarian, Tagger, & Reader
 
 Welcome to Your Comics!, a comprehensive, locally-hosted desktop application built in Python and PyQt6. This app is designed to be the ultimate hub for organizing, reading, and exploring your comic book collection. It combines local file management with powerful integrations like the Comic Vine API and Google's Gemini AI to act as your personal comic book historian, automated archivist, and reading companion.
-✨ Key Features
+
+✨ Key Features:
 
     🏷️ Automated Batch Tagger & CBR Converter: Point the app at a folder of messy .cbz or .cbr files. It will automatically parse the filenames, find the correct issue on Comic Vine, and permanently inject a universal ComicInfo.xml metadata file into the archive. It even extracts and completely converts .cbr (RAR) files into standard .cbz (ZIP) files automatically!
 
@@ -16,6 +17,7 @@ Welcome to Your Comics!, a comprehensive, locally-hosted desktop application bui
     🌐 Built-In Web Browser: A fully functional Chromium-based web browser locked to getcomics.info. Download comics directly into your library with a built-in download manager and progress tracker. All native ad-scripts and console errors are muted for a clean experience.
 
     ⚙️ UI-Driven Settings: No need to hardcode API keys! Manage your Comic Vine API key, Gemini API key, AI voice preferences, and .exe reader paths directly from the Settings tab.
+
 
 🛠️ Prerequisites & Setup
 
@@ -68,6 +70,7 @@ If you want to turn this Python script into a native Windows application that yo
     Build the app (this hides the background console and bundles everything into one file):
     Bash
 
+Or just downlaod me ready made exe!
     pyinstaller --noconsole --onefile yourcomics.py
 
     Your fully compiled yourcomics.exe will be waiting for you inside the newly created dist folder!
