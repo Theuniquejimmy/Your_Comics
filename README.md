@@ -8,8 +8,6 @@ Welcome to Your Comics!, a comprehensive, locally-hosted desktop application bui
 
     Automated Metadata Injection: Point the app at a folder of messy files. It parses filenames, searches Comic Vine, and permanently injects a universal ComicInfo.xml metadata file into the archive.
 
-    Smart Filename Parser: A robust regex engine that automatically strips out junk tags like [Digital] or (2025), handles missing issue numbers, and gracefully processes graphic novels and one-shots without crashing.
-
     On-the-Fly CBR Conversion: Automatically extracts legacy .cbr (RAR) files and repacks them into standard .cbz (ZIP) files with live percentage tracking milestones so you never have to wonder if the app is frozen.
 
 🕵️ Interactive Cover Verification
