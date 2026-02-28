@@ -73,4 +73,4 @@ If you want to turn this Python script into a native Windows application that yo
 
     Your fully compiled yourcomics.exe will be waiting for you inside the newly created dist folder!
 
-    Or just downlaod me ready made exe!
+Or just download the ready made exe!
