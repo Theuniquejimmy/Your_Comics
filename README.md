@@ -2,6 +2,8 @@
 
 A powerful, automated desktop application built with Python and PyQt6 for managing, tagging, and enhancing digital comic book collections. This tool seamlessly integrates with the Comic Vine API to fetch highly accurate metadata, converts legacy formats, injects standard `ComicInfo.xml` data, and uses AI to generate narrated summaries of your favorite issues.
 
+![splash_art](https://github.com/user-attachments/assets/18acda18-0bef-4b5b-8942-f6dfc28ecbfe)
+
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/e774b31c-c6f7-4d7d-a8d3-7d4263cffdb6" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9807c515-770b-483c-a544-132fd6aee293" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9e4b114a-23ef-4e4f-82ae-a640cc86386d" />
