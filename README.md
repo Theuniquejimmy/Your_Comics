@@ -6,7 +6,7 @@ Welcome to Your Comics!, a comprehensive, locally-hosted desktop application bui
 
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/e774b31c-c6f7-4d7d-a8d3-7d4263cffdb6" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9807c515-770b-483c-a544-132fd6aee293" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/b1a0b3c8-8098-4d2f-9f5a-da2f375c9e83" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9e4b114a-23ef-4e4f-82ae-a640cc86386d" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/059cd074-0b02-486c-af44-6b83db268327" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9476e0dd-90f5-4270-a4f5-b456d0410e93" />
 <img width="1065" height="789" alt="image" src="https://github.com/user-attachments/assets/d27ded42-54a6-4eb6-8768-8b328749f659" />
