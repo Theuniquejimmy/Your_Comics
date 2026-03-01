@@ -3,7 +3,18 @@
 An AI-Powered Local Comic Book Librarian, Tagger, & Reader
 
 Welcome to Your Comics!, a comprehensive, locally-hosted desktop application built in Python and PyQt6. This app is designed to be the ultimate hub for organizing, reading, and exploring your comic book collection. It combines local file management with powerful integrations like the Comic Vine API and Google's Gemini AI to act as your personal comic book historian, automated archivist, and reading companion.
-✨ Key Features
+
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/e774b31c-c6f7-4d7d-a8d3-7d4263cffdb6" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9807c515-770b-483c-a544-132fd6aee293" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/b1a0b3c8-8098-4d2f-9f5a-da2f375c9e83" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/059cd074-0b02-486c-af44-6b83db268327" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9476e0dd-90f5-4270-a4f5-b456d0410e93" />
+<img width="1065" height="789" alt="image" src="https://github.com/user-attachments/assets/d27ded42-54a6-4eb6-8768-8b328749f659" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/a66bbdd7-a345-47a2-af07-ca445b136830" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/809c403f-7f3a-4dae-9baa-ed3ff7af245d" />
+
+✨ Key Features:
+
 🏷️ The Ultimate Batch Tagger & CBR Converter
 
     Automated Metadata Injection: Point the app at a folder of messy files. It parses filenames, searches Comic Vine, and permanently injects a universal ComicInfo.xml metadata file into the archive.
@@ -63,22 +74,8 @@ Navigating the App:
 
     Comic Chat: Click ✨ AI Info anywhere in the app to instantly ask the AI about the selected comic.
 
-    🌐 Web Search: Browse and download new comics directly inside the app.
+    Web Search: Browse and download new comics directly inside the app.
 
-    🏷️ Batch Tagger: Select a folder of untagged comics to convert, verify, and tag them all.
-
-🏗️ Building a Standalone Executable (.exe)
-
-If you want to turn this Python script into a native Windows application without a background console, package it using PyInstaller:
-
-    Install PyInstaller:
-    Bash
-
-    pip install pyinstaller
-
-    Build the app (forcing the inclusion of the web browser core):
-    Bash
-
-    pyinstaller --noconsole --onefile --hidden-import PyQt6.QtWebEngineCore yourcomics.py
+    Batch Tagger: Select a folder of untagged comics to convert, verify, and tag them all.
 
     Your fully compiled yourcomics.exe will be waiting for you inside the newly created dist folder!
