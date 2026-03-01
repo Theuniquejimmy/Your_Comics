@@ -1,4 +1,4 @@
-🦸 Your Comics!
+🦸 **Your Comics!**
 
 A powerful, automated desktop application built with Python and PyQt6 for managing, tagging, and enhancing digital comic book collections. This tool seamlessly integrates with the Comic Vine API to fetch highly accurate metadata, converts legacy formats, injects standard `ComicInfo.xml` data, and uses AI to generate narrated summaries of your favorite issues.
 
