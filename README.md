@@ -1,8 +1,6 @@
 🦸 Your Comics!
 
-An AI-Powered Local Comic Book Librarian, Tagger, & Reader
-
-Welcome to Your Comics!, a comprehensive, locally-hosted desktop application built in Python and PyQt6. This app is designed to be the ultimate hub for organizing, reading, and exploring your comic book collection. It combines local file management with powerful integrations like the Comic Vine API and Google's Gemini AI to act as your personal comic book historian, automated archivist, and reading companion.
+A powerful, automated desktop application built with Python and PyQt6 for managing, tagging, and enhancing digital comic book collections. This tool seamlessly integrates with the Comic Vine API to fetch highly accurate metadata, converts legacy formats, injects standard `ComicInfo.xml` data, and uses AI to generate narrated summaries of your favorite issues.
 
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/e774b31c-c6f7-4d7d-a8d3-7d4263cffdb6" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9807c515-770b-483c-a544-132fd6aee293" />
@@ -13,69 +11,70 @@ Welcome to Your Comics!, a comprehensive, locally-hosted desktop application bui
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/a66bbdd7-a345-47a2-af07-ca445b136830" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/809c403f-7f3a-4dae-9baa-ed3ff7af245d" />
 
-✨ Key Features:
 
-🏷️ The Ultimate Batch Tagger & CBR Converter
+## 🚀 Key Features:
 
-    Automated Metadata Injection: Point the app at a folder of messy files. It parses filenames, searches Comic Vine, and permanently injects a universal ComicInfo.xml metadata file into the archive.
+* **Smart Metadata Tagging:** Automatically identifies comic books and injects standardized `ComicInfo.xml` metadata directly into your archives for perfect compatibility with readers like ComicRack, Kavita, and Komga.
+* **CBR to CBZ Conversion:** On-the-fly, lossless extraction and repacking of legacy `.cbr` (RAR) archives into the modern, widely supported `.cbz` (ZIP) format.
+* **Hybrid Two-Step Search Engine:** Bypasses standard API limitations by utilizing a custom hybrid search algorithm—fuzzy searching for volume names and applying strict filters for issue numbers—guaranteeing perfectly matched metadata.
+* **AI Comic Summaries:** Integrates with generative AI to produce detailed, spoiler-free summaries and overviews of specific issues.
+* **Integrated TTS Audio Player:** Turns your comic summaries into an audiobook experience using Edge TTS, complete with adjustable playback speeds, pause/resume functionality, and an "Auto-Play Next Issue" queue.
+* **EPUB Export:** Instantly compile your AI-generated summaries and Comic Vine cover art into a cleanly formatted EPUB book.
+* **Batch Processing:** Point the app at an entire directory of untagged comics and let the multi-threaded batch processor clean, convert, and tag them automatically while you monitor the progress bar.
+* **Interactive Match Resolution:** A dedicated UI pane for resolving metadata conflicts, allowing users to manually view covers and select the correct Comic Vine entry before injecting data.
 
-    On-the-Fly CBR Conversion: Automatically extracts legacy .cbr (RAR) files and repacks them into standard .cbz (ZIP) files with live percentage tracking milestones so you never have to wonder if the app is frozen.
+## 🛠️ Technologies Used:
 
-🕵️ Interactive Cover Verification
+* **Python:** Core application logic and multi-threading.
+* **PyQt6:** Modern, responsive graphical user interface.
+* **Comic Vine API:** The primary database for scraping comic covers, credits, release years, and publisher data.
+* **Patool / Zipfile:** For cross-platform archive extraction and `.cbz` repacking.
+* **Edge TTS & QtMultimedia:** For generating and playing real-time audio narration.
 
-    3-Pane Matcher UI: Compare your actual local comic cover (extracted seamlessly in the background) side-by-side with the remote Comic Vine cover before approving the tag.
+## ⚙️ Prerequisites & Setup:
 
-    Expanded Manual Search: If the auto-search fails, use the built-in search bar to manually query Comic Vine, pulling down up to 50 results at a time without ever leaving the verification window.
+**To run this application locally, you will need to set up your environment and obtain the necessary API keys.
 
-    🤖 AI Metadata Generator: If a comic isn't on Comic Vine, hit the "Add AI Info" button. The app will ping gemini-2.5-flash to hallucinate a perfectly formatted, standard JSON payload—including Writer and Artist credits—and inject it directly into your .cbz!
+Download the ready made exe!!**
 
-🤖 AI Companions & Audio
+or
 
-    "The Interrogator" AI Chat: Chat directly with an embedded Gemini AI assistant about any comic in your library. Ask for lore, backstory, or character histories.
+1. **Clone the repository:**
+```bash
+git clone https://github.com/YourUsername/Comic-Vault-Analyzer.git
+cd Comic-Vault-Analyzer
 
-    Voiced Summaries: Pull metadata from Comic Vine, generate AI summaries, and listen to an audio briefing using Text-to-Speech (TTS) with full media controls.
+```
 
-🌐 Built-In Web Browser & Settings
 
-    Integrated Downloader: A fully functional Chromium-based web browser locked to getcomics.info. Download comics directly into your library with a built-in download manager and progress tracker.
+2. **Install required dependencies:**
+```bash
+pip install -r requirements.txt
 
-    UI-Driven Settings: Manage your Comic Vine API key, Gemini API key, AI voice preferences, and .exe reader paths directly from the UI without touching the code.
+```
 
-🛠️ Prerequisites & Setup
+3. **Configure API Keys:**
+* Obtain a free API key from [Comic Vine](https://comicvine.gamespot.com/api/).
+* *(If applicable)* Obtain your AI Provider API key for the summary generation.
+* Add these keys to your environment variables or a `.env` file as specified in the configuration module.
 
-Before running the application, you will need:
+## 📖 How to Use
 
-    Comic Vine API Key: Used to pull down comic covers and metadata. (Get one at comicvine.gamespot.com/api)
+### The Batch Tagger
 
-    Gemini API Key: Powers the AI Chat, summaries, and the AI Metadata Fallback. (Get one at Google AI Studio)
+1. Navigate to the **Batch Tagger** tab.
+2. Select a folder containing your `.cbz` or `.cbr` files.
+3. The application will scan the filenames, extract the series name, issue number, and year (e.g., stripping padded zeros and handling scene tags automatically).
+4. Watch the progress as it fetches data, converts CBRs, and injects `ComicInfo.xml` files.
 
-    WinRAR or 7-Zip: Must be installed on your Windows machine to allow the patool library to extract and convert .cbr files.
+### The Comic Finder & Reader
 
-Note: You can enter your API keys directly into the app's Settings Tab on your first launch!
-📦 Installation
+1. Navigate to the **Comic Finder** tab.
+2. Search for a Volume (e.g., "The Amazing Spider-Man").
+3. Select the correct volume from the chronologically sorted dropdown.
+4. Enter an issue number and click **Analyze Single Issue**.
+5. The app will fetch the official cover art, generate a written summary, and offer TTS playback controls to read it aloud to you. Toggle **Auto-Play Next** to listen to an entire run seamlessly.
 
-Ensure you have Python 3.9+ installed on your machine. Open your terminal or command prompt and install the required dependencies:
-Bash
+## 🤝 Contributing
 
-pip install PyQt6 PyQt6-WebEngine google-generativeai requests markdown edge-tts patool
-
-🚀 Usage
-
-To launch the application from your terminal, navigate to the folder containing your script and run:
-Bash
-
-python yourcomics.py
-
-Navigating the App:
-
-    Local Details / Grid: Browse your files using a dark-mode directory tree. View high-res covers, or browse visually in the Grid tab. Hit Ctrl+Enter to open any comic in your external reader.
-
-    Comic Finder: Analyze a selected comic, fetch its data, and listen to the audio briefing.
-
-    Comic Chat: Click ✨ AI Info anywhere in the app to instantly ask the AI about the selected comic.
-
-    Web Search: Browse and download new comics directly inside the app.
-
-    Batch Tagger: Select a folder of untagged comics to convert, verify, and tag them all.
-
-    Your fully compiled yourcomics.exe will be waiting for you inside the newly created dist folder!
+Pull requests are welcome! For major changes, please open an issue first to discuss what you would like to change. Please ensure your code handles Windows file permission locks gracefully when dealing with temporary archive directories.
