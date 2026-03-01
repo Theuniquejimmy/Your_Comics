@@ -40,6 +40,14 @@ except ImportError:
     HAS_RAR = False
     
 # --- BACKGROUND THREAD FOR CONVERTING & TAGGING ---
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+    
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
 from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QListWidget, QAbstractItemView
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
@@ -1286,9 +1294,14 @@ class ComicFinderTab(QWidget):
         self.stop_btn = QPushButton("🛑 Stop")
         self.stop_btn.clicked.connect(self.stop_audio)
         
+        from PyQt6.QtWidgets import QCheckBox
+        self.autoplay_checkbox = QCheckBox("Auto-Play Next")
+        self.autoplay_checkbox.setStyleSheet("color: #50fa7b; font-weight: bold;") # Give it a nice neon green pop!
+        
         self.audio_layout.addWidget(self.play_btn)
-        self.audio_layout.addWidget(self.pause_btn) # <-- Snaps right in!
+        self.audio_layout.addWidget(self.pause_btn)
         self.audio_layout.addWidget(self.stop_btn)
+        self.audio_layout.addWidget(self.autoplay_checkbox)
         self.controls_layout.addLayout(self.audio_layout)
         
         self.controls_layout.addStretch() 
@@ -1299,6 +1312,14 @@ class ComicFinderTab(QWidget):
         self.status_label = QLabel("Ready.")
         self.status_label.setStyleSheet("color: #f1fa8c;")
         self.results_layout.addWidget(self.status_label)
+        
+        from PyQt6.QtGui import QCursor
+        self.cover_label = ClickableLabel()
+        self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cover_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.cover_label.hide() # Keep it hidden until we have a comic!
+        self.cover_label.clicked.connect(self.show_large_cover)
+        self.results_layout.addWidget(self.cover_label)
         
         self.summary_display = QTextBrowser()
         self.summary_display.setOpenExternalLinks(False)
@@ -1339,9 +1360,11 @@ class ComicFinderTab(QWidget):
 
     def change_speed(self, value):
         speed = value / 10.0
+        # 1. Always update the visual label so you know what speed is set for the next track
         self.speed_label.setText(f"Speed: {speed}x")
-        self.player.setPlaybackRate(speed)
-
+        
+        if hasattr(self, 'player') and self.player is not None:
+            self.player.setPlaybackRate(speed)
     def _get_issue_int(self):
         try:
             val = int(self.issue_input.text().strip())
@@ -1396,6 +1419,15 @@ class ComicFinderTab(QWidget):
         self.status_label.setText(f"Found {len(sorted_results)} volumes.")
 
     def fetch_and_analyze(self):
+        # --- NEW: Safely silence any playing audio immediately! ---
+        if hasattr(self, 'player') and self.player is not None:
+            self.player.stop()
+            # Reset the pause button so it doesn't get visually stuck
+            if hasattr(self, 'pause_btn'):
+                self.pause_btn.setEnabled(False)
+                self.pause_btn.setText("⏸️ Pause")
+
+        # --- Your existing code continues here ---
         self.issue_input.setText(str(self._get_issue_int()))
         
         vol_name = self.volume_combo.currentText()
@@ -1425,6 +1457,17 @@ class ComicFinderTab(QWidget):
             
         self.current_issue_data = data
         self.status_label.setText("Generating AI Summary...")
+        
+        # --- NEW: Start downloading the cover image! ---
+        img_url = data.get('image', {}).get('medium_url')
+        if img_url:
+            self.cover_label.setText("Loading cover...")
+            self.cover_label.show()
+            self.img_thread = ImageDownloadThread(img_url)
+            self.img_thread.image_ready.connect(self.on_cover_downloaded)
+            self.img_thread.start()
+        else:
+            self.cover_label.hide()
         
         vol_name = self.volume_combo.currentText().split(' (')[0]
         issue_num = self.issue_input.text()
@@ -1456,9 +1499,12 @@ class ComicFinderTab(QWidget):
             self.player.play()
             
     def stop_audio(self):
-        self.player.stop()
-        self.pause_btn.setEnabled(False)
-        self.pause_btn.setText("⏸️ Pause")
+        if hasattr(self, 'player') and self.player is not None:
+            self.player.stop()
+            
+        if hasattr(self, 'pause_btn'):
+            self.pause_btn.setEnabled(False)
+            self.pause_btn.setText("⏸️ Pause")
 
     def on_audio_ready(self, audio_data):
         from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -1488,11 +1534,16 @@ class ComicFinderTab(QWidget):
         
         # 5. Load the new temporary file and press play!
         self.player.setSource(QUrl.fromLocalFile(temp_audio_path))
+        self.player.mediaStatusChanged.connect(self.check_autoplay)
         self.player.play()
+        
         
         # 6. Wake the buttons back up so you can actually click them!
         self.pause_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
+        self.analyze_btn.setEnabled(True)
+        self.prev_btn.setEnabled(True)
+        self.next_btn.setEnabled(True)
     
 
     # ⬅️ Look at this alignment! It must line up perfectly with 'def on_audio_ready'
@@ -1506,6 +1557,23 @@ class ComicFinderTab(QWidget):
                 self.player.play()
                 self.pause_btn.setText("⏸️ Pause")
 
+    def check_autoplay(self, status):
+        from PyQt6.QtMultimedia import QMediaPlayer
+        
+        # Did the track naturally finish playing all the way to the end?
+        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+            # Is the Auto-Play box checked?
+            if hasattr(self, 'autoplay_checkbox') and self.autoplay_checkbox.isChecked():
+                self.status_label.setText("Track finished! Auto-playing next issue...")
+                
+                # Make sure the buttons disable so the user knows it's working
+                self.analyze_btn.setEnabled(False)
+                self.prev_btn.setEnabled(False)
+                self.next_btn.setEnabled(False)
+                
+                # Trigger the next issue jump!
+                self.next_issue()
+    
     def export_epub(self):
         if not self.current_summary_text: return
         save_path, _ = QFileDialog.getSaveFileName(self, "Save EPUB", f"{self.current_title}.epub", "EPUB Files (*.epub)")
@@ -1579,6 +1647,34 @@ class ComicFinderTab(QWidget):
         self.batch_progress.setValue(100)
         self.status_label.setText("Batch processing complete!")
         QMessageBox.information(self, "Batch Finished", f"All summaries successfully saved to:\n{folder_path}")
+    
+    def on_cover_downloaded(self, image_data):
+        from PyQt6.QtGui import QPixmap
+        if image_data:
+            self.current_pixmap = QPixmap()
+            self.current_pixmap.loadFromData(image_data)
+            # Scale it down so it fits nicely above the chat
+            scaled_pixmap = self.current_pixmap.scaledToHeight(300, Qt.TransformationMode.SmoothTransformation)
+            self.cover_label.setPixmap(scaled_pixmap)
+        else:
+            self.cover_label.setText("Cover load failed.")
+
+    def show_large_cover(self):
+        from PyQt6.QtWidgets import QDialog
+        if not hasattr(self, 'current_pixmap') or self.current_pixmap.isNull():
+            return
+            
+        # Create a pop-up window for the full-size image
+        dialog = QDialog(self)
+        dialog.setWindowTitle(self.current_title or "Cover Image")
+        layout = QVBoxLayout(dialog)
+        
+        large_label = QLabel()
+        large_label.setPixmap(self.current_pixmap)
+        large_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        
+        layout.addWidget(large_label)
+        dialog.exec()
 
 class ComicChatTab(QWidget):
     def __init__(self):
