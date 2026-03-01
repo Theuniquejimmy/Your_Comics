@@ -1,0 +1,16 @@
+# --- Graphical User Interface & Audio ---
+PyQt6         # The core UI framework and QtMultimedia for the audio player
+
+# --- Web Requests & API Fetching ---
+requests      # Used to communicate with the Comic Vine API and download covers
+
+# --- Archive & File Extraction ---
+patool        # The extraction engine used to open legacy .cbr (RAR) files
+
+# --- Text Formatting & Export ---
+Markdown      # Converts your AI summaries into clean HTML for the UI
+EbookLib      # Builds and compiles the .epub files with covers and chapters
+
+# --- AI & Text-to-Speech (Based on your thread names) ---
+edge-tts              # Powers the TTSWorkerThread for your audio narration
+google-generativeai   # Powers the GeminiSummaryThread for your AI summaries
