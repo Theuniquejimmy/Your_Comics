@@ -117,7 +117,11 @@ class MiniAITaggerThread(QThread):
                 "issue_number": "The issue number (as a string)",
                 "name": "The title of the specific arc/issue (leave blank if none)",
                 "cover_date": "YYYY-MM-DD (guess the year if unknown)",
-                "deck": "A 2-3 sentence summary of what this comic is about."
+                "deck": "A 2-3 sentence summary of what this comic is about.",
+                "person_credits": [
+                    {{"name": "Writer Name", "role": "writer"}},
+                    {{"name": "Artist Name", "role": "artist"}}
+                ]
             }}
             """
             
@@ -133,6 +137,57 @@ class MiniAITaggerThread(QThread):
             
         except Exception as e:
             self.error_signal.emit(str(e))
+
+from PyQt6.QtCore import QThread, pyqtSignal
+import urllib.parse
+import requests
+import time
+
+class ComicVineIssueThread(QThread):
+    # This signal sends the dictionary of metadata back to the UI
+    issue_ready = pyqtSignal(dict)
+
+    def __init__(self, vol_id=None, issue_num=None, direct_api_url=None):
+        super().__init__()
+        self.vol_id = vol_id
+        self.issue_num = issue_num
+        self.direct_api_url = direct_api_url
+
+    def run(self):
+        global COMIC_VINE_KEY
+        headers = {"User-Agent": "YourComicsApp/1.0"}
+
+        try:
+            time.sleep(1.5)  # Respect API limits
+
+            # SCENARIO 1: The Convert Button gave us a direct URL
+            if self.direct_api_url:
+                url = f"{self.direct_api_url}?api_key={COMIC_VINE_KEY}&format=json"
+            
+            # SCENARIO 2: The Finder Tab gave us a Volume ID and Issue Number
+            else:
+                issue_filter = f"volume:{self.vol_id}"
+                if self.issue_num:
+                    issue_filter += f",issue_number:{self.issue_num}"
+                url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}"
+
+            response = requests.get(url, headers=headers, timeout=10)
+            data = response.json()
+
+            if data.get('error') == 'OK':
+                if self.direct_api_url:
+                    # The direct URL endpoint returns a single dictionary object
+                    self.issue_ready.emit(data.get('results', {}))
+                else:
+                    # The filter endpoint returns a list of results
+                    results = data.get('results', [])
+                    self.issue_ready.emit(results[0] if results else {})
+            else:
+                self.issue_ready.emit({})
+
+        except Exception as e:
+            print(f"Error fetching full issue data: {e}")
+            self.issue_ready.emit({})
 
 class BatchCoverMatchDialog(QDialog):
     def __init__(self, filename, results, local_cover_bytes, parent=None):
@@ -549,43 +604,94 @@ class ComicVineSearchThread(QThread):
 
 class ComicVineIssueSearchThread(QThread):
     results_ready = pyqtSignal(list)
+
     def __init__(self, query):
         super().__init__()
-        self.query = query
+        self.query = query.strip()
 
     def run(self):
-        url = "https://comicvine.gamespot.com/api/search/"
-        params = {"api_key": COMIC_VINE_KEY, "format": "json", "query": self.query, "resources": "issue", "limit": 25}
-        try:
-            res = requests.get(url, params=params, headers={"User-Agent": "ComicVault/1.0"}).json()
-            self.results_ready.emit(res.get('results', []))
-        except:
-            self.results_ready.emit([])
+        global COMIC_VINE_KEY
+        headers = {"User-Agent": "YourComicsApp/1.0"}
+        
+        import urllib.parse
+        import requests
+        import time
+        import re
 
-class ComicVineIssueThread(QThread):
-    issue_ready = pyqtSignal(dict)
-    def __init__(self, volume_id=None, issue_num=None, direct_api_url=None):
-        super().__init__()
-        self.volume_id = volume_id
-        self.issue_num = issue_num
-        self.direct_api_url = direct_api_url
+        # --- THE QUERY PARSER ---
+        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', self.query)
+        year_str = year_match.group(1) if year_match else None
 
-    def run(self):
-        if self.direct_api_url:
-            url = self.direct_api_url
-            params = {"api_key": COMIC_VINE_KEY, "format": "json"}
+        temp_query = re.sub(r'\b(19\d{2}|20\d{2})\b', '', self.query).strip()
+
+        issue_match = re.search(r'(?:#\s*)?(\d+)(?!\d)$', temp_query)
+        if issue_match:
+            issue = str(int(issue_match.group(1)))
+            series = temp_query[:issue_match.start()].strip()
         else:
-            url = "https://comicvine.gamespot.com/api/issues/"
-            params = {"api_key": COMIC_VINE_KEY, "format": "json", "filter": f"volume:{self.volume_id},issue_number:{self.issue_num}", "field_list": "name,deck,description,character_credits,person_credits,image"}
+            issue = ""
+            series = temp_query
+
+        if not series:
+            series = self.query
+            issue = ""
+            year_str = None
+
+        # 🚨 THIS IS THE FIX: Declared at the absolute root level! 🚨
+        final_results = []
+
+        # --- THE HYBRID TWO-STEP METHOD ---
         try:
-            res = requests.get(url, params=params, headers={"User-Agent": "ComicVault/1.0"}).json()
-            if self.direct_api_url:
-                data = res.get('results', {})
-            else:
-                data = res.get('results', [])[0] if res.get('results') else {}
-            self.issue_ready.emit(data)
-        except:
-            self.issue_ready.emit({})
+            target_vol_id = None
+            
+            # STEP 1: FUZZY VOLUME SEARCH
+            vol_query = urllib.parse.quote(series)
+            vol_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=volume&query={vol_query}&limit=20"
+            
+            time.sleep(1.5)
+            vol_response = requests.get(vol_url, headers=headers, timeout=10)
+            vol_data = vol_response.json()
+            
+            if vol_data.get('error') == 'OK' and vol_data.get('number_of_total_results', 0) > 0:
+                for vol in vol_data['results']:
+                    if year_str and str(vol.get('start_year')) == year_str:
+                        target_vol_id = vol['id']
+                        break
+                if not target_vol_id and vol_data['results']:
+                    target_vol_id = vol_data['results'][0]['id']
+
+            # STEP 2: EXACT ISSUE MATCH
+            if target_vol_id:
+                issue_filter = f"volume:{target_vol_id}"
+                if issue:
+                    issue_filter += f",issue_number:{issue}"
+                    
+                issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}"
+                
+                time.sleep(1.5)
+                issue_response = requests.get(issue_url, headers=headers, timeout=10)
+                issue_data = issue_response.json()
+                
+                if issue_data.get('error') == 'OK' and issue_data.get('number_of_total_results', 0) > 0:
+                    final_results = issue_data['results']
+            
+            # STEP 3: THE OPTIONS GENERATOR (Fuzzy Fallback/Addition)
+            search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={urllib.parse.quote(self.query)}&limit=10"
+            time.sleep(1.5)
+            response = requests.get(search_url, headers=headers, timeout=10)
+            fuzzy_data = response.json()
+            
+            if fuzzy_data.get('error') == 'OK':
+                existing_ids = {r['id'] for r in final_results}
+                for r in fuzzy_data.get('results', []):
+                    if r['id'] not in existing_ids:
+                        final_results.append(r)
+
+        except Exception as e:
+            print(f"Manual Search Error: {e}")
+            
+        # Send the final list of issues directly to your UI!
+        self.results_ready.emit(final_results)
 
 class ImageDownloadThread(QThread):
     image_ready = pyqtSignal(bytes)
@@ -733,21 +839,34 @@ class GeminiChatThread(QThread):
         except Exception as e:
             self.error_occurred.emit(str(e))
 
+import re
+import asyncio
+import edge_tts
+from PyQt6.QtCore import QThread, pyqtSignal
+
 class TTSWorkerThread(QThread):
     audio_ready = pyqtSignal(bytes)
+    
     def __init__(self, text, voice):
         super().__init__()
-        self.text = re.sub(r'[^a-zA-Z0-9\s.,!?]', '', text).strip()[:4000]
+        # Added ' and - to the regex so it doesn't butcher "Spider-Man's"
+        self.text = re.sub(r"[^a-zA-Z0-9\s.,!?'\-]", '', text).strip()[:4000]
         self.voice = voice
 
     def run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
         try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
             audio_data = loop.run_until_complete(self.generate_audio())
             self.audio_ready.emit(audio_data)
-        except Exception:
+        except Exception as e:
+            # Actually print the error so we know if edge-tts failed!
+            print(f"TTS Generation Error: {e}")
             self.audio_ready.emit(b"")
+        finally:
+            # Prevent memory leaks by closing the loop when done
+            loop.close()
 
     async def generate_audio(self):
         communicate = edge_tts.Communicate(self.text, self.voice)
@@ -900,8 +1019,16 @@ class MetadataMatchDialog(QDialog):
         search_hbox = QHBoxLayout()
         self.search_input = QLineEdit()
         base_name = os.path.splitext(os.path.basename(filepath))[0]
+        
+        # 1. Extract the year
+        year_match = re.search(r'\((\d{4})\)', base_name)
+        year_str = f" {year_match.group(1)}" if year_match else ""
+        
+        # 2. Clean the name to remove the parentheses
         clean_name = re.sub(r'\(.*?\)|\[.*?\]', '', base_name).strip()
-        self.search_input.setText(clean_name)
+        
+        # 3. Combine the clean name and the year for the search box
+        self.search_input.setText(f"{clean_name}{year_str}")
         
         self.search_btn = QPushButton("Search")
         self.search_btn.clicked.connect(self.perform_search)
@@ -909,6 +1036,7 @@ class MetadataMatchDialog(QDialog):
         search_hbox.addWidget(self.search_btn)
         self.center_vbox.addLayout(search_hbox)
 
+        # --- THE RESTORED LINES ---
         self.results_list = QListWidget()
         self.results_list.itemClicked.connect(self.on_result_clicked)
         self.center_vbox.addWidget(self.results_list)
@@ -1159,11 +1287,6 @@ class ComicFinderTab(QWidget):
         self.stop_btn.clicked.connect(self.stop_audio)
         
         self.audio_layout.addWidget(self.play_btn)
-        self.audio_layout.addWidget(self.pause_btn)
-        self.audio_layout.addWidget(self.stop_btn)
-        self.controls_layout.addLayout(self.audio_layout)
-        
-        self.audio_layout.addWidget(self.play_btn)
         self.audio_layout.addWidget(self.pause_btn) # <-- Snaps right in!
         self.audio_layout.addWidget(self.stop_btn)
         self.controls_layout.addLayout(self.audio_layout)
@@ -1196,10 +1319,23 @@ class ComicFinderTab(QWidget):
         self.audio_temp_file = os.path.join(CACHE_DIR, "temp_audio.mp3")
         self.batch_thread = None
         
-        self.player = QMediaPlayer()
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    from PyQt6.QtCore import QUrl
+
+    def play_tts_audio(self, audio_file_path):
+        # 1. Create the player (MUST be self. so it doesn't get deleted)
+        self.media_player = QMediaPlayer()
+        
+        # 2. Create the speaker (MUST be self. so it doesn't get deleted)
         self.audio_output = QAudioOutput()
-        self.player.setAudioOutput(self.audio_output)
-        self.audio_output.setVolume(1.0)
+        self.audio_output.setVolume(1.0) # Set volume to 100%
+        
+        # 3. Plug the speaker into the player
+        self.media_player.setAudioOutput(self.audio_output)
+        
+        # 4. Load the file and press play!
+        self.media_player.setSource(QUrl.fromLocalFile(audio_file_path))
+        self.media_player.play()
 
     def change_speed(self, value):
         speed = value / 10.0
@@ -1244,12 +1380,20 @@ class ComicFinderTab(QWidget):
         if not results:
             self.status_label.setText("No volumes found.")
             return
+
+        # 1. SORT THE RESULTS chronologically
+        # If 'start_year' is missing or None, we default to '9999' so those unknowns drop to the very bottom of the list.
+        sorted_results = sorted(results, key=lambda v: str(v.get('start_year') or '9999'))
             
-        for v in results:
-            name = f"{v['name']} ({v.get('start_year', 'Unknown')})"
+        # 2. POPULATE THE DROPDOWN using the sorted list
+        for v in sorted_results:
+            year = v.get('start_year') or 'Unknown'
+            name = f"{v['name']} ({year})"
+            
             self.current_volumes[name] = v['id']
             self.volume_combo.addItem(name)
-        self.status_label.setText(f"Found {len(results)} volumes.")
+            
+        self.status_label.setText(f"Found {len(sorted_results)} volumes.")
 
     def fetch_and_analyze(self):
         self.issue_input.setText(str(self._get_issue_int()))
@@ -1316,39 +1460,51 @@ class ComicFinderTab(QWidget):
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("⏸️ Pause")
 
-    def on_audio_ready(self, audio_bytes):
-        self.analyze_btn.setEnabled(True)
-        self.prev_btn.setEnabled(True)
-        self.next_btn.setEnabled(True)
-        
-        if audio_bytes:
-            self.pause_btn.setEnabled(True) # Turn on the pause button!
-            self.pause_btn.setText("⏸️ Pause")
-            
-            self.player.stop()
-            from PyQt6.QtCore import QUrl, QTimer
-            self.player.setSource(QUrl())
-            
-            with open(self.audio_temp_file, "wb") as f:
-                f.write(audio_bytes)
-                
-            self.player.setSource(QUrl.fromLocalFile(os.path.abspath(self.audio_temp_file)))
-            self.status_label.setText("Analysis Complete. Audio Ready.")
-            self.player.setPlaybackRate(self.speed_slider.value() / 10.0) 
-            
-            QTimer.singleShot(150, self.player.play)
-        else:
-            self.status_label.setText("Analysis Complete. Audio Generation Failed.")
-            self.pause_btn.setEnabled(False)   
+    def on_audio_ready(self, audio_data):
+        from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PyQt6.QtCore import QUrl
+        import tempfile
+        import os
 
+        # Clear the "Generating" status so you know it finished!
+        self.status_label.setText("Audio Ready! Playing...")
+
+        # 1. Safely check if the player exists before trying to stop it
+        if hasattr(self, 'player') and self.player is not None:
+            self.player.stop()
+
+        # 2. Save the raw audio bytes into a temporary MP3 file
+        temp_audio_path = os.path.join(tempfile.gettempdir(), "temp_comic_audio.mp3")
+        with open(temp_audio_path, 'wb') as f:
+            f.write(audio_data)
+
+        # 3. Create the player and speaker (attached to 'self')
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.audio_output.setVolume(1.0) 
+        
+        # 4. Plug the speaker into the player
+        self.player.setAudioOutput(self.audio_output)
+        
+        # 5. Load the new temporary file and press play!
+        self.player.setSource(QUrl.fromLocalFile(temp_audio_path))
+        self.player.play()
+        
+        # 6. Wake the buttons back up so you can actually click them!
+        self.pause_btn.setEnabled(True)
+        self.stop_btn.setEnabled(True)
+    
+
+    # ⬅️ Look at this alignment! It must line up perfectly with 'def on_audio_ready'
     def toggle_pause(self):
         from PyQt6.QtMultimedia import QMediaPlayer
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-            self.pause_btn.setText("▶️ Resume")
-        elif self.player.playbackState() == QMediaPlayer.PlaybackState.PausedState:
-            self.player.play()
-            self.pause_btn.setText("⏸️ Pause")
+        if hasattr(self, 'player') and self.player is not None:
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.pause()
+                self.pause_btn.setText("▶️ Resume")
+            else:
+                self.player.play()
+                self.pause_btn.setText("⏸️ Pause")
 
     def export_epub(self):
         if not self.current_summary_text: return
@@ -1567,30 +1723,47 @@ class ComicChatTab(QWidget):
             self.tts_thread.audio_ready.connect(self.on_audio_ready)
             self.tts_thread.start()
 
-    def on_audio_ready(self, audio_bytes):
-        self.tts_status_label.setText("") 
-        if audio_bytes:
-            self.stop_audio_btn.setEnabled(True)
-            self.pause_btn.setEnabled(True)
-            self.pause_btn.setText("⏸️ Pause")
-            
-            self.player.stop()
-            from PyQt6.QtCore import QUrl, QTimer
-            self.player.setSource(QUrl()) 
-            
-            with open(self.audio_temp_file, "wb") as f:
-                f.write(audio_bytes)
-                
-            self.player.setSource(QUrl.fromLocalFile(os.path.abspath(self.audio_temp_file)))
-            
-            # Pull the speed dynamically from settings before playing!
-            self.player.setPlaybackRate(APP_SETTINGS["chat_speed"] / 10.0)
-            
-            QTimer.singleShot(150, self.player.play)
-        else:
-            self.stop_audio_btn.setEnabled(False)
-            self.pause_btn.setEnabled(False)
+    def on_audio_ready(self, audio_data):
+        from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+        from PyQt6.QtCore import QUrl
+        import tempfile
+        import os
 
+        # 1. Safely check if the player exists before trying to stop it
+        if hasattr(self, 'player') and self.player is not None:
+            self.player.stop()
+
+        # 2. Save the raw bytes to a temporary chat audio file!
+        temp_audio_path = os.path.join(tempfile.gettempdir(), "temp_chat_audio.mp3")
+        with open(temp_audio_path, 'wb') as f:
+            f.write(audio_data)
+
+        # 3. Create the player and speaker (attached to 'self')
+        self.player = QMediaPlayer()
+        self.audio_output = QAudioOutput()
+        self.audio_output.setVolume(1.0) 
+        
+        # 4. Plug the speaker into the player
+        self.player.setAudioOutput(self.audio_output)
+        
+        # 5. Load the new temporary file and press play!
+        self.player.setSource(QUrl.fromLocalFile(temp_audio_path))
+        self.player.play()
+        
+        # 6. NEW: Wake the buttons back up so you can actually click them!
+        if hasattr(self, 'pause_btn'): self.pause_btn.setEnabled(True)
+        if hasattr(self, 'stop_audio_btn'): self.stop_audio_btn.setEnabled(True)
+
+    # ⬅️ Look at this alignment! It must line up perfectly with 'def on_audio_ready'
+    def toggle_pause(self):
+        from PyQt6.QtMultimedia import QMediaPlayer
+        if hasattr(self, 'player') and self.player is not None:
+            if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.player.pause()
+                self.pause_btn.setText("▶️ Resume")
+            else:
+                self.player.play()
+                self.pause_btn.setText("⏸️ Pause")
     def on_error(self, err):
         self.append_chat_bubble("⚠️ Error", err, "#ff5555")
         self.send_btn.setEnabled(True)
@@ -1722,25 +1895,68 @@ class SilentWebPage(QWebEnginePage):
 import threading
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
+import os
+import re
+import time
+import urllib.parse
+import requests
+import zipfile
+import tempfile
+import shutil
+import stat
+import threading
+import xml.etree.ElementTree as ET
+from PyQt6.QtCore import QThread, pyqtSignal
+
+# --- WINDOWS ACCESS DENIED FIX ---
+def force_remove_readonly(func, path, exc_info):
+    """Clears the readonly bit on a file and reattempts the removal."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
+import os
+import re
+import time
+import urllib.parse
+import requests
+import zipfile
+import tempfile
+import shutil
+import stat
+import threading
+import xml.etree.ElementTree as ET
+from PyQt6.QtCore import QThread, pyqtSignal
+
+# --- WINDOWS ACCESS DENIED FIX ---
+def force_remove_readonly(func, path, exc_info):
+    """Clears the readonly bit on a file and reattempts the removal."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+        func(path)
+    except Exception:
+        pass
+
 class BatchTaggerThread(QThread):
     progress_update = pyqtSignal(int, str)
     finished = pyqtSignal()
-    # NEW: Signal safely passes the filename, search results, and raw image bytes!
-    needs_confirmation = pyqtSignal(str, object, bytes) 
+    needs_confirmation = pyqtSignal(str, object, bytes)
 
     def __init__(self, file_paths, interactive=True):
         super().__init__()
         self.file_paths = file_paths
         self.interactive = interactive
         self.user_choice = None
-        self.wait_event = threading.Event() 
+        self.wait_event = threading.Event()
 
     def run(self):
         global COMIC_VINE_KEY
         headers = {"User-Agent": "YourComicsApp/1.0"}
-
-        import os, re, time, urllib.parse, requests, zipfile, tempfile, shutil, patoolib
-        import xml.etree.ElementTree as ET
+        
+        # We import patoolib here to ensure the thread can access it for CBRs
+        import patoolib
 
         for i, path in enumerate(self.file_paths):
             filename = os.path.basename(path)
@@ -1753,32 +1969,102 @@ class BatchTaggerThread(QThread):
                         if 'ComicInfo.xml' in zf.namelist():
                             self.progress_update.emit(i, f"⏭️ Skipped {filename} (Already contains metadata)")
                             continue
-                except Exception: pass
+                except Exception: 
+                    pass
             
-            match = re.search(r'^(.*?)\s*#?(\d+)', os.path.splitext(filename)[0])
-            if not match:
-                self.progress_update.emit(i, f"⚠️ Could not parse filename: {filename}")
-                continue
-
-            series = match.group(1).strip()
-            issue = str(int(match.group(2))) 
+            # --- THE BULLETPROOF PARSER ---
+            base_name = os.path.splitext(filename)[0]
             
-            self.progress_update.emit(i, f"🔍 Searching Vine: {series} #{issue}...")
-            query = urllib.parse.quote(f"{series} {issue}")
-            search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={query}&limit=50"
+            # Extract year from filename BEFORE cleaning
+            year_match = re.search(r'\((\d{4})\)', base_name)
+            year_str = year_match.group(1) if year_match else ""
+            
+            # Clean the filename by stripping out (Years) and [Scene Tags]
+            clean_name = re.sub(r'\(.*?\)|\[.*?\]', '', base_name).strip()
+            
+            # Separate the Series Name from the Issue Number
+            match = re.search(r'^(.*?)\s*#?\s*(\d+)(?!\d)', clean_name)
+            
+            if match and match.group(1).strip():
+                series = match.group(1).strip()
+                issue = str(int(match.group(2)))  # Strips leading zeros!
+            else:
+                series = clean_name
+                issue = ""
+            
+            search_text = f"{series} {issue} {year_str}".strip()
+            self.progress_update.emit(i, f"🔍 Searching Vine: {search_text}...")
 
+            # --- THE HYBRID TWO-STEP METHOD ---
             try:
-                time.sleep(1.5) 
-                response = requests.get(search_url, headers=headers, timeout=10) 
-                data = response.json()
-
-                if data.get('error') == 'OK' and data.get('number_of_total_results', 0) > 0:
+                target_vol_id = None
+                
+                # STEP 1: FUZZY VOLUME SEARCH
+                vol_query = urllib.parse.quote(series)
+                vol_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=volume&query={vol_query}&limit=20"
+                
+                time.sleep(1.5)
+                vol_response = requests.get(vol_url, headers=headers, timeout=10)
+                vol_data = vol_response.json()
+                
+                if vol_data.get('error') == 'OK' and vol_data.get('number_of_total_results', 0) > 0:
+                    for vol in vol_data['results']:
+                        if year_str and str(vol.get('start_year')) == year_str:
+                            target_vol_id = vol['id']
+                            break
                     
-                    # 2. INTERACTIVE MODE: Pop the 3-Pane UI
+                    if not target_vol_id and vol_data['results']:
+                        target_vol_id = vol_data['results'][0]['id']
+
+                # Initialize data dictionary before Step 2!
+                data = {'error': 'Failed', 'results': [], 'number_of_total_results': 0}
+
+                # STEP 2: EXACT ISSUE MATCH
+                if target_vol_id:
+                    self.progress_update.emit(i, f"🎯 Step 2: Volume matched! Fetching Issue #{issue}...")
+                    
+                    issue_filter = f"volume:{target_vol_id}"
+                    if issue:
+                        issue_filter += f",issue_number:{issue}"
+                        
+                    issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}"
+                    
+                    time.sleep(1.5)
+                    issue_response = requests.get(issue_url, headers=headers, timeout=10)
+                    issue_data = issue_response.json()
+                    
+                    if issue_data.get('error') == 'OK' and issue_data.get('number_of_total_results', 0) > 0:
+                        data = issue_data
+                
+                # STEP 3: THE OPTIONS GENERATOR
+                if self.interactive or data.get('number_of_total_results', 0) == 0:
+                    if data.get('number_of_total_results', 0) == 0:
+                        self.progress_update.emit(i, f"⚠️ Strict match missed. Fetching fuzzy options...")
+                    else:
+                        self.progress_update.emit(i, f"➕ Fetching additional fuzzy options just in case...")
+                        
+                    query = urllib.parse.quote(search_text)
+                    search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={query}&limit=10"
+                    
+                    time.sleep(1.5)
+                    response = requests.get(search_url, headers=headers, timeout=10)
+                    fuzzy_data = response.json()
+
+                    if fuzzy_data.get('error') == 'OK':
+                        existing_ids = {r['id'] for r in data.get('results', [])}
+                        for r in fuzzy_data.get('results', []):
+                            if r['id'] not in existing_ids:
+                                data['results'].append(r)
+                        
+                        data['number_of_total_results'] = len(data['results'])
+
+                # --- PROCESS RESULTS & UI ---
+                if data.get('number_of_total_results', 0) > 0:
+                    
+                    # INTERACTIVE MODE: Show UI to user
                     if self.interactive:
                         local_cover_bytes = b""
                         
-                        # Sneak inside the comic to grab the local cover
                         if is_cbr:
                             temp_dir = tempfile.mkdtemp()
                             try:
@@ -1787,23 +2073,25 @@ class BatchTaggerThread(QThread):
                                 if images:
                                     with open(images[0], 'rb') as f:
                                         local_cover_bytes = f.read()
-                            except: pass
+                            except Exception: 
+                                pass
                             finally:
-                                if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+                                if os.path.exists(temp_dir):
+                                    shutil.rmtree(temp_dir, onerror=force_remove_readonly)
                         else:
                             try:
                                 with zipfile.ZipFile(path, 'r') as zf:
                                     images = sorted([f for f in zf.namelist() if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
                                     if images:
                                         local_cover_bytes = zf.read(images[0])
-                            except: pass
+                            except Exception: 
+                                pass
 
                         self.user_choice = None
                         self.wait_event.clear() 
                         
-                        # Send the data to the Main UI Thread!
                         self.needs_confirmation.emit(filename, data['results'], local_cover_bytes)
-                        self.wait_event.wait() # Thread sleeps here!
+                        self.wait_event.wait()
                         
                         if not self.user_choice:
                             self.progress_update.emit(i, f"⏭️ Skipped by user: {filename}")
@@ -1812,17 +2100,23 @@ class BatchTaggerThread(QThread):
                     else:
                         issue_data = data['results'][0]
 
-                    # 3. Build XML
+                    # BUILD XML
                     comic_info = ET.Element("ComicInfo", {"xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance", "xmlns:xsd": "http://www.w3.org/2001/XMLSchema"})
                     ET.SubElement(comic_info, "Series").text = series
-                    ET.SubElement(comic_info, "Number").text = issue
-                    if issue_data.get('volume'): ET.SubElement(comic_info, "Volume").text = issue_data['volume'].get('name', '')
-                    if issue_data.get('name'): ET.SubElement(comic_info, "Title").text = issue_data['name']
-                    if issue_data.get('cover_date'): ET.SubElement(comic_info, "Year").text = issue_data['cover_date'].split('-')[0]
-                    if issue_data.get('deck'): ET.SubElement(comic_info, "Summary").text = issue_data['deck']
+                    if issue:
+                        ET.SubElement(comic_info, "Number").text = issue
+                    if issue_data.get('volume'): 
+                        ET.SubElement(comic_info, "Volume").text = issue_data['volume'].get('name', '')
+                    if issue_data.get('name'): 
+                        ET.SubElement(comic_info, "Title").text = issue_data['name']
+                    if issue_data.get('cover_date'): 
+                        ET.SubElement(comic_info, "Year").text = issue_data['cover_date'].split('-')[0]
+                    if issue_data.get('deck'): 
+                        ET.SubElement(comic_info, "Summary").text = issue_data['deck']
+                    
                     xml_str = '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(comic_info, encoding='unicode')
 
-                    # 4. Inject Metadata / Convert CBRs
+                    # INJECT METADATA / CBR TO CBZ CONVERSION
                     if is_cbr:
                         self.progress_update.emit(i, f"📦 Extracting {filename} (This may take a moment)...")
                         temp_dir = tempfile.mkdtemp()
@@ -1851,12 +2145,13 @@ class BatchTaggerThread(QThread):
                                         
                                 zf.writestr('ComicInfo.xml', xml_str)
                                 
-                            shutil.rmtree(temp_dir)
+                            shutil.rmtree(temp_dir, onerror=force_remove_readonly)
                             os.remove(path)
                             self.progress_update.emit(i, f"✅ Converted & Tagged: {os.path.basename(new_cbz_path)}")
                         except Exception as e:
                             self.progress_update.emit(i, f"⚠️ Conversion failed: {str(e)}")
-                            if os.path.exists(temp_dir): shutil.rmtree(temp_dir)
+                            if os.path.exists(temp_dir): 
+                                shutil.rmtree(temp_dir, onerror=force_remove_readonly)
                     else:
                         with zipfile.ZipFile(path, 'a') as zf:
                             zf.writestr('ComicInfo.xml', xml_str)
@@ -1864,10 +2159,9 @@ class BatchTaggerThread(QThread):
                 else:
                     self.progress_update.emit(i, f"❌ No match on Vine for: {filename}")
 
-            # This is the crucial block that got deleted!
             except Exception as e:
                 self.progress_update.emit(i, f"⚠️ Error tagging {filename}: {str(e)}")
-                self.wait_event.set() 
+                self.wait_event.set()
 
         self.progress_update.emit(len(self.file_paths), "🎉 Batch Tagging Complete!")
         self.finished.emit()
