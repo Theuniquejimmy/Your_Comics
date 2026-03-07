@@ -17,7 +17,7 @@ Whether you're building massive Marvel reading orders, converting legacy .cbr fi
 
 ✨ Core Features:
 
-📚 Smart Library & Grid Viewer
+📚 Smart Library & Grid Viewer:
 
 Bulletproof File Parsing: An advanced regex engine that accurately reads chaotic scene release filenames, distinguishing between Volume numbers, Issue numbers, and Print Years.
 
@@ -27,7 +27,7 @@ Lying Extension Detection: Automatically detects and safely extracts ZIP files d
 
 External Reader Integration: Instantly open any comic in your preferred reader (e.g., YACReader, CDisplayEx).
 
-📋 AI Reading Lists (.cbl)
+📋 AI Reading Lists (.cbl):
 
 AI List Generator: Type "Marvel Civil War Main Event" and let Gemini build a 100% complete, chronological .cbl reading list.
 
