@@ -6,13 +6,16 @@ Whether you're building massive Marvel reading orders, converting legacy .cbr fi
 ![splash_art](https://github.com/user-attachments/assets/18acda18-0bef-4b5b-8942-f6dfc28ecbfe)
 
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/e774b31c-c6f7-4d7d-a8d3-7d4263cffdb6" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9807c515-770b-483c-a544-132fd6aee293" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9e4b114a-23ef-4e4f-82ae-a640cc86386d" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/059cd074-0b02-486c-af44-6b83db268327" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/9476e0dd-90f5-4270-a4f5-b456d0410e93" />
-<img width="1065" height="789" alt="image" src="https://github.com/user-attachments/assets/d27ded42-54a6-4eb6-8768-8b328749f659" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/a66bbdd7-a345-47a2-af07-ca445b136830" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/809c403f-7f3a-4dae-9baa-ed3ff7af245d" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/f0e24a62-9c10-44fc-99a1-735cc7f54b90" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/cce6d9ab-ca1d-4ba6-b802-334f2049524b" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/18350879-cb13-41ae-b745-ca8877d8c935" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/40cd456e-d097-4dc1-8320-17566a76bab7" />
+<img width="1657" height="1103" alt="image" src="https://github.com/user-attachments/assets/a08e06fe-843d-4cbc-b011-b492755f46f6" />
+<img width="1657" height="1103" alt="image" src="https://github.com/user-attachments/assets/3f19d505-5e23-4a98-9890-3e4bcff8d0ea" />
+<img width="1065" height="789" alt="image" src="https://github.com/user-attachments/assets/29f2cf58-2350-45d6-9beb-67bfee35ae97" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/eaf77c54-33cf-43ed-93e2-7b2774331552" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/3a9da141-65d0-482d-9599-c5f3ae616fb6" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/2f098eed-464e-4bf8-81cb-97789cc331e4" />
 
 
 ✨ Core Features:
