@@ -1,7 +1,7 @@
-🦸‍♂️ Your Comics!
+🦸‍♂️ Your Comics! (Ultimate Comic Manager)
 
-The ultimate, AI-powered comic book library manager. Comic Vault goes beyond just opening .cbz files—it uses Google's Gemini AI and the ComicVine API to organize, tag, summarize, and even read your comics to you.
-Whether you're building massive Marvel reading orders, converting legacy .cbr files, or generating deep-dive audio podcasts about your favorite issues, Comic Vault is the all-in-one Swiss Army knife for digital comic collectors.
+Your Comics! is a lightning-fast, highly advanced desktop application for comic book readers, collectors, and historians. Built with PyQt6, it combines local file management, intelligent metadata tagging, automated .cbl (Reading List) mapping, and cutting-edge AI integrations.
+Whether you are managing massive crossover events, converting CBRs, or having an AI read you a deep-dive history of your favorite issue, this app does it all.
 
 ![splash_art](https://github.com/user-attachments/assets/18acda18-0bef-4b5b-8942-f6dfc28ecbfe)
 
@@ -18,93 +18,110 @@ Whether you're building massive Marvel reading orders, converting legacy .cbr fi
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/2f098eed-464e-4bf8-81cb-97789cc331e4" />
 
 
-✨ Core Features:
+✨ Features:
 
-📚 Smart Library & Grid Viewer:
 
-Bulletproof File Parsing: An advanced regex engine that accurately reads chaotic scene release filenames, distinguishing between Volume numbers, Issue numbers, and Print Years.
 
-Natural Sorting: Intelligently sorts files mathematically (Issue 2 comes before Issue 10), rather than alphabetically.
+📁 Smart Library & Grid Management:
 
-Lying Extension Detection: Automatically detects and safely extracts ZIP files disguised as RARs (and vice-versa) without crashing.
 
-External Reader Integration: Instantly open any comic in your preferred reader (e.g., YACReader, CDisplayEx).
+3D Folder Stacks: Folders are visually represented as dynamic 3D stacks, automatically digging into subfolders to display the #1 covers of the series contained inside.
 
-📋 AI Reading Lists (.cbl):
+Infinite Image Memory: PyQt's memory limit has been completely removed, allowing the app to process massive, high-res, or AI-upscaled comic pages without crashing.
 
-AI List Generator: Type "Marvel Civil War Main Event" and let Gemini build a 100% complete, chronological .cbl reading list.
+Locked Grid Layout: Grid icons are completely locked into place, preventing accidental dragging or dropping while navigating.
 
-Lightning Cache Grid: Opening a reading list instantly scans your hard drives to match files to the list. Matches are heavily cached, meaning massive 200-issue lists load in milliseconds on the second open!
+Reading History Tracking: Both local comic files and .cbl Reading Lists are automatically pinned to your Reading History tab (with visual icons) so you can easily pick up where you left off.
 
-Missing Issue Catcher: If you don't own an issue on the reading list, it displays a red "Missing" placeholder. Clicking it automatically opens the built-in browser and searches for the missing comic!
 
-Strict Format & Year Guards: Ensures "Epic Collections" never steal slots meant for single issues, and rigorously checks ComicVine release years to keep timelines accurate.
+🏷️ Intelligent Metadata Tagging:
 
-🏷️ Batch Tagger & CBR Converter:
 
-Auto-Matching: Point the app at a folder of untagged comics. It will ping ComicVine, find the exact metadata, and inject a perfectly formatted ComicInfo.xml into the file.
+Lightning-Fast CBZ Streaming: Injecting metadata into .cbz files no longer requires extracting data to your hard drive. The app streams the zip in-memory, updating metadata in less than a second.
 
-CBR to CBZ Conversion: Safely extracts legacy .cbr (RAR) archives and repacks them as modern, standardized .cbz (ZIP) files on the fly.
+Auto CBR to CBZ Conversion: Automatically extracts .cbr archives (via rarfile or patoolib) and repacks them cleanly into .cbz format during the tagging process.
 
-Interactive Mode: Review and confirm metadata matches before they are injected.
+Advanced Event Mapping: Scrapes ComicVine not just for Writers and Artists, but also automatically captures Story Arcs, Crossover Event Names (AlternateSeries), and Reading Order Numbers.
 
-AI Metadata Fallback: If ComicVine doesn't have the data, Gemini AI will search the web and generate the ComicInfo.xml data from scratch!
+Multi-Folder Batch Tagging: Add multiple folders to the Batch Queue at once. Features an Interactive Mode to manually confirm tricky matches or inject AI data.
 
-🧠 AI Summaries & EPUB Export:
 
-Deep-Dive Analysis: Generates rich, 500-800 word summaries of any issue, detailing Context, Plot, Key Moments, and Historical Significance.
+📚 Reading Lists (.CBL) & Auto-Mapping:
 
-Batch EPUB Export: Select an entire volume (e.g., Fantastic Four Vol 1-50) and generate a folder full of beautifully formatted .epub summary books, complete with cover art.
 
-🎙️ "The Interrogator" (AI Audio & Chat):
+The "Collection Free-Pass" Engine: Intelligently maps local files to downloaded .cbl files. It knows the difference between single issues and "Epic Collections" or "Omnibuses", safely ignoring reprint year penalties and long subtitles.
 
-Text-to-Speech (TTS) Engine: Uses high-quality Microsoft Edge Neural voices to read AI summaries to you out loud like a podcast.
+Format Clash Guards: Strictly prevents a single issue from filling a slot meant for an Omnibus, and vice versa.
 
-Auto-Play: Kick back and let the app automatically play the summary of the next issue when the current one finishes.
+Missing Comic Web Search: Missing comics appear in the grid as red ❌. Clicking them automatically strips the year from the title, opens the built-in web browser, and searches GetComics.info for the exact issue.
 
-Context-Aware Chat: Jump into the "Comic Chat" tab to talk directly to Gemini about the specific issue you are looking at. Ask it questions about characters, lore, or creative teams, and it will speak its answers back to you!
+Smart-Link: Right-click any slot on a .cbl grid to manually link a local file to it.
 
-🌐 Built-In GetComics Browser:
+Export to CBL: Right-click any folder in your library to instantly generate a clean .cbl file from its contents.
 
-Silent Browsing: A custom, ad-muting web engine profile built specifically for navigating GetComics without annoying console errors or popups.
 
-Native Download Manager: Intercepts downloads directly inside the app with integrated progress bars.
+🤖 AI Integration (Gemini 2.5) & Audio:
+
+
+AI List Maker: Tell the AI (e.g., "Make a Marvel Civil War reading order") and it will search the web, compile a comprehensive list, and let you export it directly to a .cbl file.
+
+Deep-Dive Summaries: Generates 500-800 word historical essays on any selected comic, detailing the context, plot, and significance.
+
+Batch EPUB Export: Export AI summaries into standalone .epub books. (Can run in batches for entire volumes).
+
+The Interrogator (Chat): Chat directly with the AI about the currently selected comic.
+
+Edge-TTS Narrator: The app speaks AI summaries and chat responses aloud using high-quality neural voices. Features Play, Pause, Stop, custom Speed Sliders, and an "Auto-Play Next Issue" toggle!
+
+
+🖼️ Ultimate Cover Customization:
+
+
+Right-click any comic or folder in the grid to customize its display art! Your custom covers are saved safely in a local cache without altering your original files.
+
+Pick Custom Image: Browse your PC for a .jpg or .png.
+
+Pick Comic as Cover: Select a different .cbz file, and the app will automatically steal its cover to use as a folder poster.
+
+Change Cover (Select Internal): Opens a beautiful visual UI. For files, it lets you pick from the first 15 pages (great for skipping blank covers). For folders, it deep-scans the directory and lets you pick from the #1 issues inside!
+
+Reset to Default: Instantly clears overrides and re-extracts the original cover.
+
 
 🛠️ Installation & Setup:
 
-Prerequisites
+1. Run YourComics.exe
 
-Python 3.10+
+or
 
-WinRAR/UnRAR: Required for extracting .cbr files. (Ensure UnRAR.exe is installed, usually in C:\Program Files\WinRAR\).
+1. Install Python 3.9+
 
-Python Dependencies
+2. Install Required Packages:
+Open your terminal or command prompt and run:
 
-Install the required libraries using pip:
-
-pip install PyQt6 PyQt6-WebEngine requests google-genai patool rarfile edge-tts markdown EbookLib
+pip install PyQt6 PyQt6-WebEngine requests google-genai edge-tts markdown ebooklib patoolib rarfile
 
 
-Configuration
+3. API Keys (Required for Metadata & AI features):
+Open the application, navigate to the Settings tab, and input your API keys:
 
-On first launch, navigate to the Settings Tab and input:
+ComicVine API Key: Obtainable for free with a ComicVine account.
 
-ComicVine API Key: Get a free key from ComicVine.
+Gemini API Key: Obtainable for free via Google AI Studio.
+(Note: Restart the app after adding your keys for the first time).
 
-Gemini API Key: Get a free key from Google AI Studio.
+4. Optional Dependencies:
 
-Reader Executable: Path to your preferred comic reader (e.g., C:\Program Files\YACReader\YACReader.exe).
+WinRAR / UnRAR: Required for parsing .cbr files natively. If not installed, the app will attempt to fallback to patoolib.
 
-(Note: API keys require an app restart to take effect).
+YACReader: The default external reader. You can change the executable path in the Settings tab if you prefer ComicRack, CDisplayEx, etc.
 
-🚀 Usage Guide
 
-Building a Library: Go to the "Library" tab, click "+ Add Folder", and select your root comic drives.
+💡 Quick Tips:
 
-Reading Lists: Drag and drop .cbz files into the Reading Tab to build custom lists, then click "💾 Make .cbl" to save them.
 
-Fixing Missing Covers: If covers aren't loading, click "Clear Cache" in the Library tab. The app handles WebP, JPG, PNG, and ignores MacOS junk files automatically.
+The AI Fallback: If a comic isn't on ComicVine, paste the URL of a wiki page into the ComicVine search bar (or leave it with the filename info) and click "🤖 Add AI Info". The AI will scrape the webpage and perfectly format the metadata into your .cbz file.
 
-Batch Tagging: Go to the "Batch Tagger" tab, select a folder, and click Start. The background thread will safely process files without freezing the UI.
+Delete from List: Select items in your Reading List or List Maker tab and hit the Delete or Backspace key on your keyboard to instantly remove them.
 
-Built with PyQt6, Edge-TTS, and the Google Gemini API.on locks gracefully when dealing with temporary archive directories.
+Clear Cache: If images ever look wrong or outdated, go to the Library tab and click "Clear Cache" to force the app to redraw everything.
