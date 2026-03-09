@@ -6,7 +6,6 @@ Whether you are managing massive crossover events, converting CBRs, or having an
 ![splash_art](https://github.com/user-attachments/assets/18acda18-0bef-4b5b-8942-f6dfc28ecbfe)
 
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/e774b31c-c6f7-4d7d-a8d3-7d4263cffdb6" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/f0e24a62-9c10-44fc-99a1-735cc7f54b90" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/cce6d9ab-ca1d-4ba6-b802-334f2049524b" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/18350879-cb13-41ae-b745-ca8877d8c935" />
 <img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/40cd456e-d097-4dc1-8320-17566a76bab7" />
