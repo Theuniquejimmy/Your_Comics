@@ -369,7 +369,7 @@ class ComicVineIssueThread(QThread):
                 issue_filter = f"volume:{self.vol_id}"
                 if self.issue_num:
                     issue_filter += f",issue_number:{self.issue_num}"
-                url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}"
+                url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
 
             response = requests.get(url, headers=headers, timeout=10)
             data = response.json()
@@ -984,23 +984,46 @@ class CoverLoaderThread(QThread):
         self.is_running = False
         
 
-def _score_volume(vol: dict, series_name: str, issue_num: str, year_str: str) -> int:
-    """Score a Comic Vine volume result so the best match sorts first.
-
-    Higher is better.  Factors:
-      +50  exact name match (case-insensitive, stripped)
-      +30  volume has enough issues to contain the requested issue number
-      +25  start_year matches the year in the filename
-      + 0..20  proportional to count_of_issues (prefer the longest/main run)
+def _norm_vol_name(s: str) -> str:
+    """Normalise a volume name for fuzzy matching.
+    Converts colons, dashes, underscores to spaces and collapses whitespace
+    so "Dark Days: The Forge" == "Dark Days - The Forge" == "Dark Days The Forge".
     """
-    score = 0
-    vol_name  = str(vol.get('name') or '').lower().strip()
-    want_name = series_name.lower().strip()
+    s = re.sub(r'[:–—_-]', ' ', s.lower())
+    return re.sub(r'\s+', ' ', s).strip()
 
-    if vol_name == want_name:
-        score += 50
-    elif want_name and want_name in vol_name:
+
+def _score_volume(vol: dict, series_name: str, issue_num: str, year_str: str,
+                  subtitle: str = "", vol_num: str = "") -> int:
+    """Score a Comic Vine volume result so the best match sorts first."""
+    score = 0
+    vol_name_raw  = str(vol.get('name') or '').lower().strip()
+    want_name_raw = series_name.lower().strip()
+    want_sub_raw  = subtitle.lower().strip()
+
+    # Normalised forms (colon/dash → space) for fuzzy matching
+    vol_name_n  = _norm_vol_name(vol_name_raw)
+    want_name_n = _norm_vol_name(want_name_raw)
+    want_sub_n  = _norm_vol_name(want_sub_raw)
+
+    # Subtitle match (TPB named volumes e.g. "Batman: Superheavy")
+    if want_sub_n and f"{want_name_n} {want_sub_n}" in vol_name_n:
+        score += 60
+    elif want_sub_n and want_sub_n in vol_name_n:
         score += 20
+
+    # Series name match — prefer normalised exact, then raw exact, then contains
+    if vol_name_n == want_name_n:
+        score += 50
+    elif vol_name_raw == want_name_raw:
+        score += 50
+    elif want_name_n and want_name_n in vol_name_n:
+        score += 25
+    elif want_name_raw and want_name_raw in vol_name_raw:
+        score += 20
+    elif want_name_n and vol_name_n in want_name_n:
+        # series name contains the vol name (e.g. "Dark Days" in "Dark Days - The Forge")
+        score += 10
 
     count = int(vol.get('count_of_issues') or 0)
     if issue_num:
@@ -1009,17 +1032,191 @@ def _score_volume(vol: dict, series_name: str, issue_num: str, year_str: str) ->
                 score += 30
         except ValueError:
             pass
-
-    if year_str:
+    elif vol_num:
         try:
-            if str(vol.get('start_year')) == year_str:
-                score += 25
-        except Exception:
+            if count >= int(vol_num):
+                score += 15
+        except ValueError:
             pass
 
-    # Slight preference for longer runs (main series vs one-shots / tie-ins)
-    score += min(20, count // 10)
+    # Proximity year scoring
+    if year_str:
+        try:
+            iy = int(year_str)
+            sy = int(vol.get('start_year') or 0)
+            if sy > 0 and sy <= iy:
+                gap = iy - sy
+                if gap <= 2:
+                    score += 30
+                elif gap <= 5:
+                    score += 22
+                elif gap <= 10:
+                    score += 15
+                elif gap <= 20:
+                    score += 8
+        except (ValueError, TypeError):
+            pass
+
+    # Boost "deluxe edition" / "book" style collected volumes when we have a
+    # vol_num — these are almost always what "Book NN" filenames refer to.
+    # Without this the main series (exact name match +50) beats the Deluxe Edition.
+    if vol_num:
+        vol_name_n_check = _norm_vol_name(vol_name_raw)
+        if 'deluxe' in vol_name_n_check or 'omnibus' in vol_name_n_check:
+            score += 35
+        elif re.search(r'\bbook\b', vol_name_n_check):
+            score += 20
+
+    score += min(10, count // 20)
+
+    # Prefer known English-language publishers so the vol picker never latches
+    # onto a Spanish/French/German edition of the same series
+    publisher = str((vol.get('publisher') or {}).get('name') or '').lower()
+    english_publishers = {'dc comics', 'marvel comics', 'image comics',
+                          'dark horse comics', 'idw publishing', 'boom! studios',
+                          'dynamite entertainment', 'valiant', 'vertigo', 'wildstorm',
+                          'aftershock comics', 'oni press'}
+    if any(ep in publisher for ep in english_publishers):
+        score += 25
+    elif publisher and any(c in publisher for c in ('edicion', 'panini', 'planeta',
+                                                     'glenat', 'urban', 'semic',
+                                                     'ehapa', 'dino', 'mg publishing')):
+        score -= 40
+
     return score
+
+
+def parse_comic_filename_full(base_name: str) -> dict:
+    """Parse any comic filename into structured fields.
+
+    Handles: reading-order prefixes, #NN, bare NN, vNN/Vol NN/Book NN,
+    TPB/omnibus keywords, One-Shot, story-annotation noise, dash subtitles,
+    and embedded cover-date strings.
+
+    Returns dict: series, vol_num, issue, subtitle, year, is_tpb
+    """
+    year_match = re.search(r'\((\d{4})\)', base_name)
+    year = year_match.group(1) if year_match else ""
+
+    # Extract edition keywords from brackets BEFORE stripping them.
+    # e.g. "(Omnibus Edition)" → edition_hint="omnibus"
+    #      "(Deluxe Edition)"  → edition_hint="deluxe"
+    # This survives the bracket strip so Case 2 can use it as a subtitle.
+    edition_hint = ""
+    for bracket in re.findall(r'\(([^)]+)\)', base_name):
+        bl = bracket.lower()
+        if 'omnibus' in bl:
+            edition_hint = 'omnibus'
+            break
+        if 'deluxe' in bl:
+            edition_hint = 'deluxe'
+            break
+
+    clean = re.sub(r'\(.*?\)|\[.*?\]', '', base_name).strip()
+    clean = re.sub(r'[\s\-_]+$', '', clean).strip()
+
+    # Normalise underscores → spaces (common in Empire/Glorith release filenames)
+    # Do this BEFORE trailing-junk strip so "..._002_" is handled correctly
+    clean = re.sub(r'_', ' ', clean)
+    clean = re.sub(r' {2,}', ' ', clean).strip()
+    clean = re.sub(r'[\s\-]+$', '', clean).strip()
+
+    # Strip leading reading-order prefixes: "008 ", "002 - ", "15. "
+    # Only strip if the number is zero-padded (starts with 0: 001, 008)
+    # OR is 1-2 bare digits (1, 5, 12). Never strip 100+, which are title words.
+    clean = re.sub(r'^(0\d*|\d{1,2})[\.\-\s]+', '', clean).strip()
+
+    # Strip embedded cover-date strings: ", 1996-12-00" or "1996-01"
+    clean = re.sub(r',?\s*(19|20)\d{2}-\d{2}(-\d{2})?', '', clean).strip()
+    clean = re.sub(r'[,\s]+$', '', clean).strip()
+
+    # Strip story-annotation noise: "B story", "A story", "c stories" etc.
+    clean = re.sub(r'\s+[A-Ca-c]\s+stor(?:y|ies)\b.*$', '', clean, flags=re.I).strip()
+
+    # Strip bare trailing year not inside parens: "...1998"
+    clean = re.sub(r'\s+(19|20)\d{2}\s*$', '', clean).strip()
+
+    # Case 1: issue with #
+    m_issue = re.search(r'^(.*?)\s*#\s*(\d+)', clean)
+    if m_issue:
+        series = re.sub(r'\s+(?:v|vol|volume)\.?\s*\d+$', '',
+                        m_issue.group(1).strip(), flags=re.I).strip()
+        return dict(series=series, vol_num="", issue=str(int(m_issue.group(2))),
+                    subtitle="", year=year, is_tpb=False)
+
+    # Case 2: vNN / Vol NN / Book NN (before dash check)
+    m_vol = re.search(r'(?i)(?<!\w)(?:v|vol|volume|book|bk)\.?\s*0*(\d+)\b', clean)
+    if m_vol:
+        series = clean[:m_vol.start()].strip().rstrip('-\u2013\u2014 \t')
+        vol_num = m_vol.group(1)
+        after = clean[m_vol.end():].strip()
+        m_sub = re.match(r'^[-\u2013\u2014:]\s*(.+)', after)
+        subtitle = m_sub.group(1).strip() if m_sub else ""
+        # If no subtitle: check edition_hint from brackets first (e.g. Omnibus),
+        # then synthesise "Book N" if the vol token was "Book NN"
+        if not subtitle:
+            if edition_hint:
+                subtitle = edition_hint
+            elif re.match(r'(?i)book', m_vol.group(0).strip()):
+                subtitle = f"Book {vol_num}"
+        return dict(series=series, vol_num=vol_num, issue="",
+                    subtitle=subtitle, year=year, is_tpb=True)
+
+    # Case 3: TPB / omnibus keyword
+    m_tpb = re.search(
+        r'(?i)\b(tpb|trade\s+paperback|graphic\s+novel|omnibus|compendium|deluxe)\b', clean)
+    if m_tpb:
+        series = clean[:m_tpb.start()].strip().rstrip('-\u2013\u2014 ')
+        subtitle = clean[m_tpb.end():].strip().lstrip('-\u2013\u2014 ')
+        return dict(series=series, vol_num="", issue="",
+                    subtitle=subtitle, year=year, is_tpb=True)
+
+    # Case 4: One-Shot keyword — strip it and the trailing number is issue 1
+    m_oneshot = re.search(r'(?i)\bone-?shot\b', clean)
+    if m_oneshot:
+        without = (clean[:m_oneshot.start()] + clean[m_oneshot.end():]).strip().rstrip('-\u2013\u2014 ')
+        m_trail = re.search(r'^(.*?)\s+0*(\d+)\s*$', without)
+        if m_trail and m_trail.group(1).strip():
+            series = m_trail.group(1).strip()
+        else:
+            series = without
+        return dict(series=series, vol_num="", issue="1", subtitle="", year=year, is_tpb=False)
+
+    # Case 5: dash separator
+    m_dash = re.search(r'\s+[-\u2013\u2014]\s+', clean)
+    if m_dash:
+        left  = clean[:m_dash.start()].strip()
+        right = clean[m_dash.end():].strip()
+
+        # 5a: left ends with a number → "Tales from AoA 02 - Sinister Bloodlines"
+        m_left_num = re.search(r'^(.*?)\s+0*(\d+)\s*$', left)
+        if m_left_num and m_left_num.group(1).strip():
+            subtitle = re.sub(r'\s+(19|20)\d{2}\s*$', '', right).strip()
+            return dict(series=m_left_num.group(1).strip(), vol_num="",
+                        issue=str(int(m_left_num.group(2))), subtitle=subtitle,
+                        year=year, is_tpb=False)
+
+        if not re.match(r'^\d+\s*$', right):
+            # 5b: right ends with a number → "Batman - Legends of the Dark Knight 002"
+            m_right_num = re.search(r'^(.*?)\s+0*(\d+)\s*$', right)
+            if m_right_num and m_right_num.group(1).strip():
+                # Preserve dash so series matches CV: "Batman - Legends of the Dark Knight"
+                full_series = f"{left} - {m_right_num.group(1).strip()}".strip()
+                return dict(series=full_series, vol_num="",
+                            issue=str(int(m_right_num.group(2))),
+                            subtitle="", year=year, is_tpb=False)
+            # 5c: pure subtitle ("Batman - The Dark Knight Returns")
+            return dict(series=left, vol_num="", issue="",
+                        subtitle=right, year=year, is_tpb=True)
+
+    # Case 6: bare trailing number ("Batman 021", "X-Men Chronicles 002")
+    m_end = re.search(r'^(.*?)\s+0*(\d+)\s*$', clean)
+    if m_end and m_end.group(1).strip() and not re.match(r'^\d+$', m_end.group(1).strip()):
+        return dict(series=m_end.group(1).strip(), vol_num="", issue=str(int(m_end.group(2))),
+                    subtitle="", year=year, is_tpb=False)
+
+    return dict(series=clean, vol_num="", issue="", subtitle="", year=year, is_tpb=False)
+
 
 class ComicVineSearchThread(QThread):
     results_ready = pyqtSignal(list)
@@ -1085,23 +1282,19 @@ class ComicVineIssueSearchThread(QThread):
         
 
         # --- THE QUERY PARSER ---
-        year_match = re.search(r'\b(19\d{2}|20\d{2})\b', self.query)
-        year_str = year_match.group(1) if year_match else None
-
-        temp_query = re.sub(r'\b(19\d{2}|20\d{2})\b', '', self.query).strip()
-
-        issue_match = re.search(r'(?:#\s*)?(\d+)(?!\d)$', temp_query)
-        if issue_match:
-            issue = str(int(issue_match.group(1)))
-            series = temp_query[:issue_match.start()].strip()
-        else:
-            issue = ""
-            series = temp_query
+        parsed   = parse_comic_filename_full(self.query)
+        series   = parsed['series']
+        issue    = parsed['issue']
+        year_str = parsed['year']
+        subtitle = parsed['subtitle']
+        vol_num  = parsed['vol_num']
 
         if not series:
-            series = self.query
-            issue = ""
-            year_str = None
+            series   = self.query
+            issue    = ""
+            year_str = ""
+            subtitle = ""
+            vol_num  = ""
 
         # 🚨 THIS IS THE FIX: Declared at the absolute root level! 🚨
         final_results = []
@@ -1119,7 +1312,7 @@ class ComicVineIssueSearchThread(QThread):
                 f"https://comicvine.gamespot.com/api/volumes/"
                 f"?api_key={COMIC_VINE_KEY}&format=json"
                 f"&filter=name:{vol_query}&limit=30"
-                f"&field_list=id,name,start_year,count_of_issues,api_detail_url"
+                f"&field_list=id,name,start_year,count_of_issues,publisher,api_detail_url"
             )
             time.sleep(1.5)
             r1 = requests.get(filter_url, headers=headers, timeout=10).json()
@@ -1140,11 +1333,44 @@ class ComicVineIssueSearchThread(QThread):
                 for v in r2.get('results', []):
                     vol_combined[v['id']] = v
 
+            # Pass 1c: for TPBs search additional queries to catch named volumes
+            if subtitle:
+                time.sleep(1.0)
+                full_query = urllib.parse.quote(f"{series} {subtitle}")
+                r3 = requests.get(
+                    f"https://comicvine.gamespot.com/api/search/"
+                    f"?api_key={COMIC_VINE_KEY}&format=json"
+                    f"&resources=volume&query={full_query}&limit=10",
+                    headers=headers, timeout=10
+                ).json()
+                if r3.get('error') == 'OK':
+                    for v in r3.get('results', []):
+                        vol_combined[v['id']] = v
+                # Pass 1d: 'Book N' or 'omnibus/deluxe' filenames →
+                # also try 'series deluxe' and 'series omnibus'
+                for extra_kw in ('deluxe', 'omnibus'):
+                    triggers = [
+                        re.match(r'(?i)^book\s*\d+$', subtitle),
+                        extra_kw in subtitle.lower(),
+                    ]
+                    if any(triggers):
+                        time.sleep(0.8)
+                        eq = urllib.parse.quote(f"{series} {extra_kw}")
+                        r4 = requests.get(
+                            f"https://comicvine.gamespot.com/api/search/"
+                            f"?api_key={COMIC_VINE_KEY}&format=json"
+                            f"&resources=volume&query={eq}&limit=10",
+                            headers=headers, timeout=10
+                        ).json()
+                        if r4.get('error') == 'OK':
+                            for v in r4.get('results', []):
+                                vol_combined[v['id']] = v
+
             vol_results = list(vol_combined.values())
             if vol_results:
                 # Score every candidate and pick the best one
                 vol_results.sort(
-                    key=lambda v: _score_volume(v, series, issue, year_str),
+                    key=lambda v: _score_volume(v, series, issue, year_str, subtitle, vol_num),
                     reverse=True
                 )
                 target_vol_id = vol_results[0]['id']
@@ -1155,7 +1381,7 @@ class ComicVineIssueSearchThread(QThread):
                 if issue:
                     issue_filter += f",issue_number:{issue}"
                     
-                issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}"
+                issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
                 
                 time.sleep(1.5)
                 issue_response = requests.get(issue_url, headers=headers, timeout=10)
@@ -1164,21 +1390,81 @@ class ComicVineIssueSearchThread(QThread):
                 if issue_data.get('error') == 'OK' and issue_data.get('number_of_total_results', 0) > 0:
                     final_results = issue_data['results']
             
-            # STEP 3: THE OPTIONS GENERATOR (Fuzzy Fallback/Addition)
-            search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={urllib.parse.quote(self.query)}&limit=10"
-            time.sleep(1.5)
-            response = requests.get(search_url, headers=headers, timeout=10)
-            fuzzy_data = response.json()
-            
-            if fuzzy_data.get('error') == 'OK':
-                existing_ids = {r['id'] for r in final_results}
-                for r in fuzzy_data.get('results', []):
-                    if r['id'] not in existing_ids:
-                        final_results.append(r)
+            # STEP 3: FUZZY ISSUE SEARCH
+            # For TPBs: search specifically by subtitle to surface the TPB issue record.
+            # For regular issues: only run as fallback if step 2 found nothing.
+            if parsed.get('is_tpb'):
+                tpb_query = urllib.parse.quote(
+                    f"{series} {subtitle}".strip() if subtitle else series
+                )
+                tpb_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={tpb_query}&limit=15&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
+                time.sleep(1.5)
+                r3 = requests.get(tpb_url, headers=headers, timeout=10).json()
+                if r3.get('error') == 'OK':
+                    existing_ids = {r['id'] for r in final_results}
+                    for r in r3.get('results', []):
+                        if r['id'] not in existing_ids:
+                            final_results.append(r)
+            elif not final_results:
+                search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={urllib.parse.quote(self.query)}&limit=10&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
+                time.sleep(1.5)
+                response = requests.get(search_url, headers=headers, timeout=10)
+                fuzzy_data = response.json()
+                if fuzzy_data.get('error') == 'OK':
+                    existing_ids = {r['id'] for r in final_results}
+                    for r in fuzzy_data.get('results', []):
+                        if r['id'] not in existing_ids:
+                            final_results.append(r)
 
         except Exception as e:
             print(f"Manual Search Error: {e}")
-            
+
+        # Sort so the best match is first in the dialog
+        def _score_issue(r):
+            score = 0
+            vol = r.get('volume', {}) or {}
+            vol_name   = str(vol.get('name') or '').lower()
+            issue_name = str(r.get('name') or '').lower()
+            issue_num  = str(r.get('issue_number') or '')
+
+            # Penalise non-English issues — kills foreign-language editions
+            lang = str(r.get('language') or '').lower()
+            if lang and lang != 'english':              score -= 80
+
+            _vn = _norm_vol_name(vol_name)
+            _wn = _norm_vol_name(series)
+            if _vn and _vn == _wn:                         score += 50
+            elif _wn and _wn in _vn:                       score += 25
+            elif _wn and _vn in _wn:                       score += 15
+            if year_str:
+                result_year = str(r.get('cover_date', ''))[:4]
+                if result_year == year_str:         score += 25
+                elif result_year and result_year != year_str: score -= 20
+
+            if parsed.get('is_tpb'):
+                # Lower vol bonus for TPBs — subtitle/page signals are dominant
+                if target_vol_id and str(vol.get('id', '')) == str(target_vol_id): score += 30
+                if re.search(r'\bvol\.?\s*\d', issue_name, re.I):    score += 200
+                if subtitle and subtitle.lower() in issue_name:       score += 150
+                if vol_num and issue_num == vol_num:                   score += 100
+                try:
+                    if int(r.get('page_count') or 0) > 100:           score += 120
+                except (ValueError, TypeError): pass
+                try:
+                    n = int(issue_num)
+                    if n > 50:   score -= 80
+                    elif n > 20: score -= 40
+                except (ValueError, TypeError): pass
+            else:
+                # Strong vol bonus for regular issues — the matched volume is very likely right
+                if target_vol_id and str(vol.get('id', '')) == str(target_vol_id): score += 60
+                if issue and issue_num == issue:                       score += 80
+                if subtitle and subtitle.lower() in issue_name:       score += 40
+
+            return score
+
+        final_results.sort(key=_score_issue, reverse=True)
+
         # Send the final list of issues directly to your UI!
         self.results_ready.emit(final_results)
 
@@ -3264,21 +3550,19 @@ class BatchTaggerThread(QThread):
             
             # --- THE BULLETPROOF PARSER ---
             base_name = os.path.splitext(filename)[0]
-            year_match = re.search(r'\((\d{4})\)', base_name)
-            year_str = year_match.group(1) if year_match else ""
-            clean_name = re.sub(r'\(.*?\)|\[.*?\]', '', base_name).strip()
-            
-            match = re.search(r'^(.*?)\s*#\s*(\d+)', clean_name)
-            if not match: match = re.search(r'^(.*?)\s+(\d+)\s*$', clean_name)
-                
-            if match and match.group(1).strip():
-                series = match.group(1).strip()
-                issue = str(int(match.group(2)))  
+            parsed   = parse_comic_filename_full(base_name)
+            series   = parsed['series']
+            issue    = parsed['issue']
+            vol_num  = parsed['vol_num']
+            subtitle = parsed['subtitle']
+            year_str = parsed['year']
+            is_tpb   = parsed['is_tpb']
+
+            # For TPBs include the subtitle so the fuzzy fallback query is specific
+            if is_tpb and subtitle:
+                search_text = f"{series} {subtitle} {year_str}".strip()
             else:
-                series = clean_name
-                issue = ""
-            
-            search_text = f"{series} {issue} {year_str}".strip()
+                search_text = f"{series} {issue} {year_str}".strip()
 
             # --- THE HYBRID THREE-STEP METHOD ---
             try:
@@ -3294,7 +3578,7 @@ class BatchTaggerThread(QThread):
                         issue_filter = f"volume:{vid}"
                         if issue: issue_filter += f",issue_number:{issue}"
                         
-                        issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}"
+                        issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
                         time.sleep(1.5)
                         issue_response = requests.get(issue_url, headers=headers, timeout=10)
                         issue_data = issue_response.json()
@@ -3312,12 +3596,12 @@ class BatchTaggerThread(QThread):
                     vol_query = urllib.parse.quote(series)
                     vol_combined = {}
 
-                    # Pass 1a: broad filter endpoint
+                    # Pass 1a: broad filter on series name
                     filter_url = (
                         f"https://comicvine.gamespot.com/api/volumes/"
                         f"?api_key={COMIC_VINE_KEY}&format=json"
                         f"&filter=name:{vol_query}&limit=30"
-                        f"&field_list=id,name,start_year,count_of_issues,api_detail_url"
+                        f"&field_list=id,name,start_year,count_of_issues,publisher,api_detail_url"
                     )
                     time.sleep(1.5)
                     r1 = requests.get(filter_url, headers=headers, timeout=10).json()
@@ -3327,7 +3611,7 @@ class BatchTaggerThread(QThread):
 
                     time.sleep(1.0)
 
-                    # Pass 1b: exact search endpoint
+                    # Pass 1b: exact search on series name
                     search_vol_url = (
                         f"https://comicvine.gamespot.com/api/search/"
                         f"?api_key={COMIC_VINE_KEY}&format=json"
@@ -3338,11 +3622,44 @@ class BatchTaggerThread(QThread):
                         for v in r2.get('results', []):
                             vol_combined[v['id']] = v
 
+                    # Pass 1c: for TPBs, search 'series subtitle' for named volumes
+                    if is_tpb and subtitle:
+                        time.sleep(1.0)
+                        full_query = urllib.parse.quote(f"{series} {subtitle}")
+                        r3 = requests.get(
+                            f"https://comicvine.gamespot.com/api/search/"
+                            f"?api_key={COMIC_VINE_KEY}&format=json"
+                            f"&resources=volume&query={full_query}&limit=10",
+                            headers=headers, timeout=10
+                        ).json()
+                        if r3.get('error') == 'OK':
+                            for v in r3.get('results', []):
+                                vol_combined[v['id']] = v
+                        # Pass 1d: 'Book N' or omnibus/deluxe filenames ->
+                        # also try 'series deluxe' and 'series omnibus'
+                        for extra_kw in ('deluxe', 'omnibus'):
+                            triggers = [
+                                re.match(r'(?i)^book\s*\d+$', subtitle),
+                                extra_kw in subtitle.lower(),
+                            ]
+                            if any(triggers):
+                                time.sleep(0.8)
+                                eq = urllib.parse.quote(f"{series} {extra_kw}")
+                                r4 = requests.get(
+                                    f"https://comicvine.gamespot.com/api/search/"
+                                    f"?api_key={COMIC_VINE_KEY}&format=json"
+                                    f"&resources=volume&query={eq}&limit=10",
+                                    headers=headers, timeout=10
+                                ).json()
+                                if r4.get('error') == 'OK':
+                                    for v in r4.get('results', []):
+                                        vol_combined[v['id']] = v
+
                     vol_results = list(vol_combined.values())
                     if vol_results:
                         # Score every candidate and pick the best one
                         vol_results.sort(
-                            key=lambda v: _score_volume(v, series, issue, year_str),
+                            key=lambda v: _score_volume(v, series, issue, year_str, subtitle, vol_num),
                             reverse=True
                         )
                         target_vol_id = vol_results[0]['id']
@@ -3354,7 +3671,7 @@ class BatchTaggerThread(QThread):
                     self.progress_update.emit(i, f"🎯 Volume matched! Fetching Issue #{issue}...")
                     issue_filter = f"volume:{target_vol_id}"
                     if issue: issue_filter += f",issue_number:{issue}"
-                    issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}"
+                    issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
                     
                     time.sleep(1.5)
                     issue_response = requests.get(issue_url, headers=headers, timeout=10)
@@ -3364,27 +3681,110 @@ class BatchTaggerThread(QThread):
                         data = issue_data
                 
                 # ========================================================
-                # STEP 3: THE OPTIONS GENERATOR (Fuzzy Fallback)
+                # STEP 3: FUZZY ISSUE SEARCH
+                # For TPBs: search by "series subtitle" to find the specific
+                # TPB issue record on Comic Vine.
+                # For regular issues: only run if step 2 found nothing.
                 # ========================================================
-                if self.interactive or data.get('number_of_total_results', 0) == 0:
-                    if data.get('number_of_total_results', 0) == 0:
-                        self.progress_update.emit(i, f"⚠️ Strict match missed. Fetching fuzzy options...")
-                    else:
-                        self.progress_update.emit(i, f"➕ Fetching additional fuzzy options just in case...")
-                        
-                    query = urllib.parse.quote(search_text)
-                    search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={query}&limit=10"
-                    
+                step2_found = data.get('number_of_total_results', 0) > 0
+
+                if is_tpb:
+                    # Search specifically for the TPB by subtitle
+                    tpb_query = urllib.parse.quote(
+                        f"{series} {subtitle}".strip() if subtitle else series
+                    )
+                    search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={tpb_query}&limit=15&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
                     time.sleep(1.5)
                     response = requests.get(search_url, headers=headers, timeout=10)
                     fuzzy_data = response.json()
-
                     if fuzzy_data.get('error') == 'OK':
                         existing_ids = {r['id'] for r in data.get('results', [])}
                         for r in fuzzy_data.get('results', []):
                             if r['id'] not in existing_ids:
                                 data['results'].append(r)
                         data['number_of_total_results'] = len(data['results'])
+                elif not step2_found or self.interactive:
+                    if not step2_found:
+                        self.progress_update.emit(i, f"⚠️ Strict match missed. Fetching fuzzy options...")
+                    else:
+                        self.progress_update.emit(i, f"➕ Fetching additional fuzzy options...")
+                    query = urllib.parse.quote(search_text)
+                    search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={query}&limit=10"
+                    time.sleep(1.5)
+                    response = requests.get(search_url, headers=headers, timeout=10)
+                    fuzzy_data = response.json()
+                    if fuzzy_data.get('error') == 'OK':
+                        existing_ids = {r['id'] for r in data.get('results', [])}
+                        for r in fuzzy_data.get('results', []):
+                            if r['id'] not in existing_ids:
+                                data['results'].append(r)
+                        data['number_of_total_results'] = len(data['results'])
+
+                # ── Sort results so the best match is at the top of the dialog ──
+                def _score_issue_result(r):
+                    score = 0
+                    vol = r.get('volume', {}) or {}
+                    vol_name  = str(vol.get('name') or '').lower()
+                    issue_name = str(r.get('name') or '').lower()
+                    issue_num  = str(r.get('issue_number') or '')
+                    want       = series.lower()
+                    want_sub   = subtitle.lower()
+
+                    # Penalise non-English issues heavily
+                    lang = str(r.get('language') or '').lower()
+                    if lang and lang != 'english':                  score -= 80
+
+                    # ── Volume name match (normalised so dash==colon) ──
+                    _vn = _norm_vol_name(vol_name)
+                    _wn = _norm_vol_name(want)
+                    if _vn and _vn == _wn:                         score += 50
+                    elif _wn and _wn in _vn:                       score += 25
+                    elif _wn and _vn in _wn:                       score += 15
+
+                    # ── Year match / mismatch ──
+                    if year_str:
+                        result_year = str(r.get('cover_date', ''))[:4]
+                        if result_year == year_str:          score += 25
+                        elif result_year and result_year != year_str: score -= 20
+
+                    if is_tpb:
+                        # Lower vol bonus for TPBs — subtitle/page signals dominate
+                        if target_vol_id and str(vol.get('id', '')) == str(target_vol_id):
+                            score += 30
+                        # ── TPB-specific boosters ──
+                        if re.search(r'\bvol\.?\s*\d', issue_name, re.I):
+                            score += 200
+                        if want_sub and want_sub in issue_name:
+                            score += 150
+                        if vol_num and issue_num == vol_num:
+                            score += 100
+                        try:
+                            if int(r.get('page_count') or 0) > 100:
+                                score += 120
+                        except (ValueError, TypeError):
+                            pass
+                        try:
+                            n = int(issue_num)
+                            if n > 50:
+                                score -= 80
+                            elif n > 20:
+                                score -= 40
+                        except (ValueError, TypeError):
+                            pass
+                    else:
+                        # Strong vol bonus for regular issues
+                        if target_vol_id and str(vol.get('id', '')) == str(target_vol_id):
+                            score += 60
+                        if issue and issue_num == issue:
+                            score += 80
+                        if want_sub and want_sub in issue_name:
+                            score += 40
+
+                    return score
+
+                if data.get('results'):
+                    data['results'].sort(key=_score_issue_result, reverse=True)
+                # ─────────────────────────────────────────────────────────────
 
                 # --- PROCESS RESULTS & UI ---
                 if data.get('number_of_total_results', 0) > 0:
@@ -3438,7 +3838,7 @@ class BatchTaggerThread(QThread):
                     # --- BUILD STRICT COMICRACK XML ---
                     comic_info = ET.Element("ComicInfo", {"xmlns:xsi": "http://www.w3.org/2001/XMLSchema-instance", "xmlns:xsd": "http://www.w3.org/2001/XMLSchema"})
 
-                    m_vol_override = re.search(r'(?i)\b(?:v|vol|volume|book|bk|tpb)\.?\s*0*(\d+)', clean_name)
+                    m_vol_override = re.search(r'(?i)\b(?:v|vol|volume|book|bk|tpb)\.?\s*0*(\d+)', base_name)
                     local_issue = m_vol_override.group(1) if m_vol_override else issue
                     cv_num = str(issue_data.get('issue_number') or "")
                     final_number = local_issue if (bool(m_vol_override) and local_issue) else (cv_num or local_issue)
@@ -4167,12 +4567,36 @@ class HoverSummaryList(QListWidget):
             # Item was deleted before the timer fired (grid reloaded, etc.)
             self._hovered_item = None
             return
-        if not user_str or user_str.startswith("FOLDER:") or user_str.startswith("MISSING:"):
+        if not user_str or user_str.startswith("MISSING:"):
             return
+
+        # ── Resolve the target comic path ──
+        if user_str.startswith("FOLDER:"):
+            folder_path = user_str[7:]
+            # Find the first naturally-sorted comic in the folder
+            target_comic = None
+            try:
+                files = os.listdir(folder_path)
+                files.sort(key=lambda f: [
+                    int(t) if t.isdigit() else t.lower()
+                    for t in re.split(r'(\d+)', f)
+                ])
+                for f in files:
+                    if f.lower().endswith(('.cbz', '.cbr')):
+                        target_comic = os.path.join(folder_path, f)
+                        break
+            except Exception as _e:
+                log.warning("Folder hover scan failed: %s", _e)
+            if not target_comic:
+                return
+            user_str = target_comic
+            # Title defaults to the folder name
+            title = os.path.basename(folder_path)
+        else:
+            title = os.path.splitext(os.path.basename(user_str))[0]
 
         # Read ComicInfo.xml from the CBZ/CBR for the summary
         summary = ""
-        title   = os.path.splitext(os.path.basename(user_str))[0]
         try:
             if user_str.lower().endswith(".cbz"):
                 with zipfile.ZipFile(user_str, "r") as zf:
@@ -4330,12 +4754,14 @@ class ComicBrowser(QMainWindow):
                 return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', s)]
             files.sort(key=natural_sort_key)
             
+            cbl_files = []
             for file in files:
                 full_path = os.path.normpath(os.path.join(folder_path, file))
                 if full_path in getattr(self, 'hidden_paths', set()): 
                     continue
                 if os.path.isdir(full_path): directory_items.append((file, full_path))
                 elif file.lower().endswith(('.cbz', '.cbr')): comic_files.append(full_path)
+                elif file.lower().endswith('.cbl'): cbl_files.append(full_path)
 
             # --- 1. DRAW FOLDERS (Placeholder Stacks) ---
             folders_to_load = []
@@ -4374,8 +4800,17 @@ class ComicBrowser(QMainWindow):
                 item = QListWidgetItem(filename_only)
                 item.setData(Qt.ItemDataRole.UserRole, full_path)
                 self.grid_list.addItem(item)
-                self.grid_items_map[full_path] = item 
-                    
+                self.grid_items_map[full_path] = item
+
+            # --- 3. DRAW CBL READING LIST FILES ---
+            for full_path in cbl_files:
+                filename_only = os.path.splitext(os.path.basename(full_path))[0]
+                item = QListWidgetItem(f"📋 {filename_only}")
+                item.setData(Qt.ItemDataRole.UserRole, f"CBL:{full_path}")
+                item.setForeground(QColor('#ffb86c'))
+                item.setIcon(self._make_cbl_icon(full_path))
+                self.grid_list.addItem(item)
+
         except PermissionError: pass 
         
         # --- UPDATE NAVIGATION UI ---
@@ -4483,7 +4918,6 @@ class ComicBrowser(QMainWindow):
                 log.warning("Suppressed exception: %s", _e)
         self.current_comic_path = None
         self._current_xml_str   = None
-        self._current_cover_pixmap = None
         self._cover_size = 500  # fixed at max — no slider
         self.libraries_file = "libraries.json"
         self.reading_file = "reading_list.json"
@@ -4623,13 +5057,10 @@ class ComicBrowser(QMainWindow):
         left_layout = QVBoxLayout(left_pane)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.cover_label = ClickableLabel("Select a comic\nto view details")
+        self.cover_label = QLabel("Select a comic\nto view details")
         self.cover_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover_label.setMinimumWidth(260)
         self.cover_label.setStyleSheet("color: #6272a4;")
-        self.cover_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.cover_label.setToolTip("Click to view full-size cover")
-        self.cover_label.clicked.connect(self._show_full_cover)
         left_layout.addWidget(self.cover_label, 1)
 
         # Right pane — info box + More Info button
@@ -5291,6 +5722,7 @@ class ComicBrowser(QMainWindow):
         self.grid_list.setUpdatesEnabled(False)
         directory_items = []
         comic_files = []
+        cbl_files = []
         
         for res in results:
             # --- THE HIDE FILTER ---
@@ -5298,8 +5730,12 @@ class ComicBrowser(QMainWindow):
                 continue
             # -----------------------
             
-            if res['is_folder']: directory_items.append((res['name'], res['path']))
-            else: comic_files.append(res['path'])
+            if res['is_folder']:
+                directory_items.append((res['name'], res['path']))
+            elif res['path'].lower().endswith('.cbl'):
+                cbl_files.append(res['path'])
+            else:
+                comic_files.append(res['path'])
             
         # --- DRAW FOLDERS ---
         folders_to_load = []
@@ -5338,7 +5774,16 @@ class ComicBrowser(QMainWindow):
             item = QListWidgetItem(filename_only)
             item.setData(Qt.ItemDataRole.UserRole, full_path)
             self.grid_list.addItem(item)
-            self.grid_items_map[full_path] = item 
+            self.grid_items_map[full_path] = item
+
+        # --- DRAW CBL FILES ---
+        for full_path in cbl_files:
+            filename_only = os.path.splitext(os.path.basename(full_path))[0]
+            item = QListWidgetItem(f"📋 {filename_only}")
+            item.setData(Qt.ItemDataRole.UserRole, f"CBL:{full_path}")
+            item.setForeground(QColor('#ffb86c'))
+            item.setIcon(self._make_cbl_icon(full_path))
+            self.grid_list.addItem(item)
                 
         self.grid_list.setUpdatesEnabled(True)
 
@@ -5480,6 +5925,14 @@ class ComicBrowser(QMainWindow):
         
         user_str = str(user_data)
         
+        # --- PHASE 0: CBL READING LIST ---
+        if user_str.startswith("CBL:"):
+            cbl_path = user_str[4:]
+            if os.path.exists(cbl_path):
+                self.tabs.setCurrentIndex(1)  # switch to Local Grid tab
+                self.load_cbl_grid(cbl_path)
+            return
+
         # --- PHASE 1: FOLDER NAVIGATION! ---
         if user_str.startswith("FOLDER:"):
             folder_path = user_str.split("FOLDER:")[1]
@@ -6261,7 +6714,6 @@ class ComicBrowser(QMainWindow):
                 if img_data:
                     pixmap = QPixmap()
                     pixmap.loadFromData(img_data)
-                    self._current_cover_pixmap = pixmap  # stored for click-to-zoom
                     w = getattr(self, '_cover_size', 250)
                     h = int(w * 1.52)
                     scaled_pixmap = pixmap.scaled(
@@ -6324,24 +6776,6 @@ class ComicBrowser(QMainWindow):
         dlg.exec()
         self.load_comic_data(self.current_comic_path)
 
-    def _on_cover_size_changed(self, value):
-        self._cover_size = value
-        APP_SETTINGS["cover_size"] = value
-        try:
-            with open("settings.json", "w") as f:
-                json.dump(APP_SETTINGS, f)
-        except Exception as _e:
-            log.warning("Could not save cover_size setting: %s", _e)
-        # Re-render the cover at the new size if one is loaded
-        if self._current_cover_pixmap and not self._current_cover_pixmap.isNull():
-            h = int(value * 1.52)  # keep comic-cover aspect ratio ~2:3
-            scaled = self._current_cover_pixmap.scaled(
-                value, h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-            self.cover_label.setPixmap(scaled)
-
     def _set_grid_item_icon(self, items, cover_bytes, w, h):
         """Render cover_bytes at w x h and apply to items. Uses a fallback tile if no bytes."""
         pixmap = QPixmap()
@@ -6399,35 +6833,126 @@ class ComicBrowser(QMainWindow):
             covers = folder_cache.get(os.path.normpath(folder_path), [])
             self.update_folder_icon(folder_path, covers)
 
-    def _show_full_cover(self):
-        if not self._current_cover_pixmap or self._current_cover_pixmap.isNull():
-            return
-        title = os.path.basename(self.current_comic_path) if self.current_comic_path else "Cover"
-        dlg = QDialog(self)
-        dlg.setWindowTitle(title)
-        dlg.setStyleSheet("QDialog { background-color: #282a36; }")
-        layout = QVBoxLayout(dlg)
-        layout.setContentsMargins(8, 8, 8, 8)
-        lbl = QLabel()
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # Scale to 85% of the screen so the dialog isn't bigger than the monitor
-        screen = QApplication.primaryScreen().availableGeometry()
-        max_w = int(screen.width()  * 0.85)
-        max_h = int(screen.height() * 0.85)
-        lbl.setPixmap(self._current_cover_pixmap.scaled(
-            max_w, max_h,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        ))
-        layout.addWidget(lbl)
-        dlg.exec()
-
     def save_hidden_paths(self):
         try:
             with open(self.hidden_file, 'w') as f:
                 json.dump(list(self.hidden_paths), f)
         except Exception as _e:
             log.warning("Suppressed exception: %s", _e)
+    def _make_cbl_icon(self, cbl_path: str, img_bytes: bytes = None) -> QIcon:
+        """Build and return a QIcon for a CBL tile.
+        If img_bytes is provided it is used as the cover image.
+        Otherwise checks the custom cache, then falls back to the 📋 default design."""
+        gs = APP_SETTINGS.get('grid_size', 180)
+        gh = int(gs * 1.5)
+
+        # Check custom cache if no bytes supplied
+        if not img_bytes:
+            norm = os.path.normpath(cbl_path)
+            file_hash = hashlib.md5(norm.encode('utf-8')).hexdigest()
+            custom_path = os.path.join(CACHE_DIR, f"custom_{file_hash}.jpg")
+            if os.path.exists(custom_path):
+                try:
+                    with open(custom_path, 'rb') as f:
+                        img_bytes = f.read()
+                except Exception as _e:
+                    log.warning("Could not read CBL custom cover: %s", _e)
+
+        # Draw with a real image if we have one
+        if img_bytes:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(img_bytes) and not pixmap.isNull():
+                scaled = pixmap.scaled(gs, gh, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+                canvas = QPixmap(gs, gh)
+                canvas.fill(QColor('#21222c'))
+                painter = QPainter(canvas)
+                # Centre the scaled image
+                ox = (gs - scaled.width())  // 2
+                oy = (gh - scaled.height()) // 2
+                painter.drawPixmap(ox, oy, scaled)
+                # Amber border so it's still visually distinct as a CBL
+                painter.setPen(QColor('#ffb86c'))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRect(0, 0, gs - 1, gh - 1)
+                painter.end()
+                return QIcon(canvas)
+
+        # Default 📋 design
+        pixmap = QPixmap(gs, gh)
+        pixmap.fill(QColor('#21222c'))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QColor('#44475a'))
+        painter.setBrush(QColor('#282a36'))
+        painter.drawRoundedRect(int(gs * 0.06), int(gh * 0.06),
+                                int(gs * 0.88), int(gh * 0.88), 6, 6)
+        painter.setPen(QColor('#ffb86c'))
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(max(8, gs // 20))
+        painter.setFont(font)
+        painter.drawText(0, 0, gs, int(gh * 0.35),
+                         Qt.AlignmentFlag.AlignCenter, '\U0001f4cb')
+        painter.end()
+        return QIcon(pixmap)
+
+    def _apply_cbl_cover(self, cbl_path: str, img_bytes: bytes):
+        """Save img_bytes as the custom cover for a CBL and refresh its grid tile."""
+        norm = os.path.normpath(cbl_path)
+        file_hash = hashlib.md5(norm.encode('utf-8')).hexdigest()
+        custom_path = os.path.join(CACHE_DIR, f"custom_{file_hash}.jpg")
+        try:
+            with open(custom_path, 'wb') as f:
+                f.write(img_bytes)
+        except Exception as _e:
+            log.warning("Could not save CBL custom cover: %s", _e)
+            return
+        # Find the grid item and refresh its icon
+        for i in range(self.grid_list.count()):
+            it = self.grid_list.item(i)
+            try:
+                if str(it.data(Qt.ItemDataRole.UserRole)) == f"CBL:{cbl_path}":
+                    it.setIcon(self._make_cbl_icon(cbl_path, img_bytes))
+                    break
+            except RuntimeError:
+                pass
+
+    def _go_to_file_in_tree(self, path: str):
+        """Expand and select a file or folder in the left-panel tree."""
+        path = os.path.normpath(path)
+
+        # First make sure the library root that contains this path is loaded.
+        # Walk up the directory tree and expand each level so the model
+        # populates the path before we try to select it.
+        ancestors = []
+        p = path if os.path.isdir(path) else os.path.dirname(path)
+        while True:
+            ancestors.append(p)
+            parent = os.path.dirname(p)
+            if parent == p:  # reached drive root
+                break
+            p = parent
+        ancestors.reverse()
+
+        for ancestor in ancestors:
+            src_idx = self.model.index(ancestor)
+            if src_idx.isValid():
+                proxy_idx = self.proxy_model.mapFromSource(src_idx)
+                if proxy_idx.isValid():
+                    self.tree.expand(proxy_idx)
+
+        source_idx = self.model.index(path)
+        if not source_idx.isValid():
+            return
+        proxy_idx = self.proxy_model.mapFromSource(source_idx)
+        if not proxy_idx.isValid():
+            return
+
+        self.left_tabs.setCurrentIndex(0)
+        self.tree.setCurrentIndex(proxy_idx)
+        self.tree.scrollTo(proxy_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
+
     def show_grid_context_menu(self, pos):
         
         item = self.grid_list.itemAt(pos)
@@ -6450,8 +6975,74 @@ class ComicBrowser(QMainWindow):
             return
 
         # IF YOU CLICKED A COMIC/FOLDER -> HIDE & EDIT OPTIONS!
+        user_str = str(item.data(Qt.ItemDataRole.UserRole) or "")
+
+        # CBL gets its own menu
+        if user_str.startswith("CBL:"):
+            cbl_path = user_str[4:]
+            open_cbl_action    = menu.addAction("📋 Open Reading List")
+            goto_cbl_action    = menu.addAction("📍 Go to File Location")
+            menu.addSeparator()
+            cbl_img_action     = menu.addAction("🖼️ Set Custom Image Cover")
+            cbl_comic_action   = menu.addAction("📕 Pick Comic as Cover")
+            cbl_reset_action   = menu.addAction("🔄 Reset to Default Cover")
+            action = menu.exec(self.grid_list.mapToGlobal(pos))
+            if action == open_cbl_action and os.path.exists(cbl_path):
+                self.tabs.setCurrentIndex(1)
+                self.load_cbl_grid(cbl_path)
+            elif action == goto_cbl_action:
+                self._go_to_file_in_tree(cbl_path)
+            elif action == cbl_img_action:
+                img_path, _ = QFileDialog.getOpenFileName(
+                    self, "Select Cover Image", "", "Images (*.png *.jpg *.jpeg *.webp)")
+                if img_path:
+                    with open(img_path, 'rb') as f:
+                        self._apply_cbl_cover(cbl_path, f.read())
+            elif action == cbl_comic_action:
+                comic_path, _ = QFileDialog.getOpenFileName(
+                    self, "Select Comic to use as Cover", "", "Comic Archives (*.cbz *.cbr)")
+                if comic_path:
+                    valid_exts = ('.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif')
+                    img_bytes = None
+                    try:
+                        if comic_path.lower().endswith('.cbz'):
+                            with zipfile.ZipFile(comic_path, 'r') as zf:
+                                imgs = sorted(f for f in zf.namelist()
+                                              if f.lower().endswith(valid_exts)
+                                              and "__MACOSX" not in f)
+                                if imgs: img_bytes = zf.read(imgs[0])
+                        else:
+                            with rarfile.RarFile(comic_path, 'r') as rf:
+                                imgs = sorted(f for f in rf.namelist()
+                                              if f.lower().endswith(valid_exts))
+                                if imgs: img_bytes = rf.read(imgs[0])
+                    except Exception as _e:
+                        log.warning("CBL comic cover extract failed: %s", _e)
+                    if img_bytes:
+                        self._apply_cbl_cover(cbl_path, img_bytes)
+                    else:
+                        QMessageBox.warning(self, "Error", "Could not extract an image from that comic.")
+            elif action == cbl_reset_action:
+                norm = os.path.normpath(cbl_path)
+                file_hash = hashlib.md5(norm.encode('utf-8')).hexdigest()
+                custom_path = os.path.join(CACHE_DIR, f"custom_{file_hash}.jpg")
+                if os.path.exists(custom_path):
+                    try: os.remove(custom_path)
+                    except Exception as _e: log.warning("CBL reset cover failed: %s", _e)
+                # Redraw with default design
+                for i in range(self.grid_list.count()):
+                    it = self.grid_list.item(i)
+                    try:
+                        if str(it.data(Qt.ItemDataRole.UserRole)) == f"CBL:{cbl_path}":
+                            it.setIcon(self._make_cbl_icon(cbl_path))
+                            break
+                    except RuntimeError:
+                        pass
+            return
+
         link_action = menu.addAction("🔗 Smart-Link Comic(s)")
         tagger_action = menu.addAction("🏷️ Send to Tagger")
+        goto_action = menu.addAction("📍 Go to File Location")
         menu.addSeparator()
         cover_internal_action = menu.addAction("📑 Change Cover (Select Internal)")
         cover_comic_action = menu.addAction("📕 Pick Comic as Cover")
@@ -6466,12 +7057,20 @@ class ComicBrowser(QMainWindow):
         if action == link_action:
             self.manual_link_comics(item)
         elif action == tagger_action:
-            user_str = str(item.data(Qt.ItemDataRole.UserRole))
             if not user_str.startswith("MISSING:"):
                 target_path = user_str.split("FOLDER:")[1] if user_str.startswith("FOLDER:") else user_str
                 self._ensure_tab_built(self._TAB_TAGGER)
                 self.tagger_tab.receive_folder(target_path)
                 self.tabs.setCurrentIndex(self._TAB_TAGGER)
+        elif action == goto_action:
+            if not user_str.startswith("MISSING:"):
+                if user_str.startswith("FOLDER:"):
+                    target_path = user_str[7:]
+                elif user_str.startswith("CBL:"):
+                    target_path = user_str[4:]
+                else:
+                    target_path = user_str
+                self._go_to_file_in_tree(target_path)
         elif action == cover_img_action:
             self.pick_custom_cover(item)
         elif action == cover_comic_action:
@@ -6481,7 +7080,6 @@ class ComicBrowser(QMainWindow):
         elif action == reset_action:
             self.reset_default_cover(item)
         elif action == hide_action:
-            user_str = str(item.data(Qt.ItemDataRole.UserRole))
             if not user_str.startswith("MISSING:"): 
                 target_path = user_str.split("FOLDER:")[1] if user_str.startswith("FOLDER:") else user_str
                 norm_path = os.path.normpath(target_path)
