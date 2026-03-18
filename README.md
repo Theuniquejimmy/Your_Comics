@@ -1,131 +1,214 @@
-🦸‍♂️ Your Comics!
-
-Your Comics is a powerful, fully-featured desktop application for managing, tagging, and exploring your digital comic collection. Built with PyQt6, it combines lightning-fast local library management with the deep lore of Comic Vine and the analytical power of Google's Gemini AI.
-Whether you are mapping complex reading orders, converting legacy CBRs, generating deep-dive audio summaries, or just trying to get your ComicInfo.xml tags perfect, this app does it all.
-
 ![splash_art](https://github.com/user-attachments/assets/18acda18-0bef-4b5b-8942-f6dfc28ecbfe)
 
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/80408c1a-9a33-4bc0-9881-311329ab7cdb" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/cce6d9ab-ca1d-4ba6-b802-334f2049524b" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/18350879-cb13-41ae-b745-ca8877d8c935" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/40cd456e-d097-4dc1-8320-17566a76bab7" />
-<img width="1657" height="1103" alt="image" src="https://github.com/user-attachments/assets/a08e06fe-843d-4cbc-b011-b492755f46f6" />
-<img width="1657" height="1103" alt="image" src="https://github.com/user-attachments/assets/3f19d505-5e23-4a98-9890-3e4bcff8d0ea" />
-<img width="1065" height="789" alt="image" src="https://github.com/user-attachments/assets/29f2cf58-2350-45d6-9beb-67bfee35ae97" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/eaf77c54-33cf-43ed-93e2-7b2774331552" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/3a9da141-65d0-482d-9599-c5f3ae616fb6" />
-<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/2f098eed-464e-4bf8-81cb-97789cc331e4" />
+# Your Comics! 🦸
+
+A full-featured desktop comic book manager built with Python and PyQt6. Organize, tag, read, and discover your comic collection — all in one app.
+
+---
+
+## Requirements
+
+- Python 3.10+
+- PyQt6, PyQt6-WebEngine
+- `requests`, `edge-tts`, `markdown`, `patoolib`, `google-genai`
+- A free [Comic Vine API key](https://comicvine.gamespot.com/api/) for metadata
+- A free [Google Gemini API key](https://aistudio.google.com/) for AI features
+- WinRAR / UnRAR for CBR support (optional)
+
+---
+
+## Features at a Glance
+
+<img width="1628" height="1228" alt="image" src="https://github.com/user-attachments/assets/ec4d33ab-ff1c-41da-b27b-1a97f2442377" />
+### Local Details Tab
+Your main reading view. Select any comic from the tree and see:
+
+- **Large cover image** on the left
+- **Full metadata panel** on the right — series, issue, publisher, year, summary, creators, story arcs, characters, teams, and locations
+- **Navigation row** with Prev/Next issue buttons and folder-jump arrows (`«` / `»`) that step through your entire library folder by folder in natural sort order
+- **AI Chat button** that drops you straight into a chat about the open comic
+- **Convert/Tag button** that opens the ComicVine Cover Matcher dialog so you can match, preview, and inject metadata into any CBZ or convert a CBR on the spot
+- **More Info / Edit button** (when ComicInfo.xml is present) — opens a full scrollable dialog showing all 35 ComicInfo fields, lets you edit any of them, and saves directly back into the CBZ
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/9eb3445f-900e-4871-981b-8c39e6c47e7b" />
+### Local Grid Tab
+A visual grid browser for your collection.
+
+- **Adjustable grid size** — slider from 80 to 360px wide; covers re-render at full quality as you drag
+- **Folder stack tiles** — folders show a stacked-covers preview that scales with the slider
+- **CBL reading list tiles** — `.cbl` files appear as distinct amber 📋 tiles with optional custom covers
+- **Hover summary popup** — hover any comic or folder tile for 2.5 seconds to see the series title and plot summary pulled live from the embedded ComicInfo.xml
+- **Search** — full-text search across all your libraries returns comics, folders, and CBLs in the grid, all properly rendered and clickable
+- **Right-click context menu** on any item:
+  - Smart-Link Comic(s) — match missing files in a CBL reading list
+  - Send to Tagger
+  - Go to File Location — expands and highlights the item in the left-panel tree
+  - Change Cover — pick an internal page, another comic's cover, or a custom image
+  - Pick Comic as Cover / Reset to Default Cover
+  - Hide Item
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/23e3d940-a602-456c-8efd-4e05fb867a7e" />
+### Comic Finder Tab
+Search Comic Vine for any volume and browse its issues.
+
+- Dual-endpoint volume search (`/api/volumes/?filter=name:` for breadth + `/api/search/` for precision) returns up to 75 results merged and deduplicated
+- Results sorted by issue count descending so the main run always appears first
+- "The" prefix handling — `Sensational She-Hulk` automatically also searches `The Sensational She-Hulk`
+- Click any volume to load its full issue list with cover thumbnails, dates, and story arcs
+- Select an issue to preview the Comic Vine cover and inject metadata
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/59bd2262-b076-4ba5-9af3-6334f5b8739e" />
+### Comic Chat Tab
+Talk to an AI about any comic in your collection.
+
+- Powered by Google Gemini 2.5 Flash with Google Search grounding
+- Reads the comic's existing metadata as context
+- **Text-to-speech playback** via Microsoft Edge TTS — choose from 9 voices (US, British, Australian) and set playback speed
+- Full conversation history with a scrollable dark chat bubble UI
+- Pause / resume / stop playback controls
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/714815de-cb24-4706-9881-b65d3a8aab51" />
+### Batch Tagger Tab
+Tag your entire collection automatically.
+
+- **Drop folders or individual files** — supports CBZ and CBR
+- **Interactive mode** — shows a side-by-side cover matcher dialog for each file so you confirm every match before writing
+- **Auto mode** — runs silently, writes metadata immediately, then opens a post-run Review dialog
+
+**Smart filename parser** understands:
+- Zero-padded reading-order prefixes (`008 Batman 021` → series: Batman, issue: 21)
+- Bare issue numbers (`Batman 021`)
+- Volume/TPB notation (`Batman v08 - Superheavy`, `Saga Vol 01`, `100 Bullets - Book 01`)
+- Omnibus/Deluxe edition hints in brackets (`Gantz v02 (Omnibus Edition)`)
+- Issue numbers inside brackets (`Darkstars, 1994-04-00 (_21)`)
+- Embedded date strings (`1994-04-00`)
+- Underscored filenames (`Batman_-_Legends_of_the_Dark_Knight_002`)
+
+**Three-pass volume search** for every file:
+1. Broad filter (`/api/volumes/?filter=name:`) — up to 50 results
+2. Exact search (`/api/search/?resources=volume`) — precision top matches
+3. "The" variant pass — catches series like `The Sensational She-Hulk`
+4. Subtitle/deluxe/omnibus passes for TPBs and collected editions
+
+**Smart volume scoring** picks the right run using: name similarity (colon/dash normalised), proximity year scoring (prefers `Batman (2011)` over `Batman (1940)` for a 2013 issue), English publisher preference, issue count, and issue-number containment.
+
+**Smart issue scoring** promotes: results from the matched volume, exact issue number match, year match, language (penalises non-English editions by −80 pts), subtitle match for TPBs, and page count > 100 for collected editions.
+
+**Checkboxes:**
+- **Interactive Mode** — confirm each match manually
+- **Overwrite Existing Metadata** — re-tag files that already have ComicInfo.xml
+- **AI Summaries** — when enabled, if Comic Vine has no plot summary for a matched issue, Gemini searches the web and writes one automatically; if Comic Vine finds no match at all, Gemini does a full AI tag from the filename
+
+**Force Volume URL** — paste any Comic Vine volume URL to force the tagger to look there first; useful for obscure series or variant editions
+
+**Post-run Review Dialog** (auto mode):
+- Side-by-side: your file's cover vs. the Comic Vine matched cover
+- Back/Next to step through every tagged file
+- Re-search button — pre-fills a smart query from the filename and auto-triggers the search
+- Select any result from the list and click **Overwrite File** to re-tag instantly with a deep metadata fetch
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/10c63897-724f-401c-8daa-d296bec2e3ad" />
+### Getcomic.info Tab
+An embedded browser pointed at GetComics.info for finding download links.
+
+- Full navigation bar with back, forward, and URL input
+- Downloads are intercepted and saved automatically
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/fceea31a-0657-43b5-9c88-1ca2b99aedf1" />
+### List Maker Tab
+Build `.cbl` comic reading lists.
+
+- Drag and drop comics onto the list
+- Load existing `.cbl` files
+- **AI List Generator** — describe what you want (`"Best Batman stories featuring Ra's al Ghul"`) and Gemini searches your library and Comic Vine to build a curated reading list
+- **DieselTech CBL Browser** — browse and download reading lists from the DieselTech GitHub repository directly inside the app; double-click any folder to navigate, double-click any `.cbl` to queue it for download
+- Save lists as `.cbl` files compatible with other readers
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/23292bfe-ce7d-4d60-9a47-b6bd7ae648fd" />
+### New Releases Tab
+See what came out this week.
+
+- Fetches this week's new issues from Comic Vine using the `store_date` field (actual shelf date)
+- **2-column card grid** with 140×210px covers, title, issue name, and a Download button per card
+- **Publisher grouping** with coloured header badges — DC Comics (blue), Marvel (red), Image Comics (orange), Dark Horse, IDW, BOOM!, Dynamite, Valiant, and more; sorted DC → Marvel → everyone else by volume descending
+- **Week navigation** — `◀ Prev Week` and `Next Week ▶` step in 7-day increments; weeks are Wednesday-aligned (new comic day)
+- **Download button** on each card opens GetComics.info with a pre-filled search for that title
+- Refresh button to re-fetch
+
+---
+
+<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/5fb213a8-22db-412c-8e28-6e86c262968a" />
+### Settings Tab
+- Comic Vine API key
+- Google Gemini API key
+- YACReader (or any reader) executable path
+- Comic Chat voice and speed settings
+
+---
+
+## Library Management
+
+The **left panel tree** shows your full library with a file system view.
+
+- Add multiple library root folders — they all appear merged in the tree
+- **Filter bar** — live-filters the tree as you type
+- **Hidden items** — right-click anything to hide it from both tree and grid; unhide all from the grid's empty-area context menu
+- CBL files appear in the tree and are openable directly
+
+---
+
+## Cover Customisation
+
+Any item in the grid (comic, folder, or CBL file) can have a custom cover:
+
+- **Pick an internal page** from inside the comic
+- **Pick another comic's cover** — extracts the first page from any CBZ/CBR
+- **Pick a custom image** — any PNG/JPG/WebP
+- **Reset to default** — removes the override and regenerates from the comic itself
+
+Custom covers are stored in a local cache keyed by file path and survive app restarts. Cache is stored at 600×900px so covers look sharp at any grid size.
+
+---
+
+## File Format Support
+
+| Format | Read | Write | Notes |
+|--------|------|-------|-------|
+| CBZ | ✅ | ✅ | Native ZIP-based format |
+| CBR | ✅ | ✅ | Converted to CBZ on tag |
+| PDF | ✅ | — | Browse only |
+| CBL | ✅ | ✅ | Reading list format |
+
+---
+
+## Metadata Standard
+
+All metadata is written as **ComicInfo.xml** (ComiCRack standard) embedded inside the CBZ. Fields written include:
+
+Series, Number, Title, Publisher, Imprint, Format, AgeRating, Year, Month, Day, Summary, PageCount, Web, Writer, Penciller, Inker, Colorist, Letterer, CoverArtist, Editor, StoryArc, AlternateSeries, AlternateNumber, AlternateCount, Characters, Teams, Locations, ScanInformation, SeriesGroup, LanguageISO, BlackAndWhite, Manga, PlayCount, and more.
+
+---
+
+## Tips
+
+- **Auto mode is fastest** — turn off Interactive Mode, enable AI Summaries, and let the batch tagger run overnight on your whole collection
+- **Force a volume URL** when the tagger picks the wrong run — paste the Comic Vine volume URL into the Force URL box
+- **CBL files in the grid** support custom covers too — right-click and pick any image or comic cover
+- **Hover summary popups** work on folder tiles too — it reads the first issue's summary from inside the folder
+- **Re-search in the review dialog** auto-fires immediately when you click the button, using a clean parsed query — no need to hit Search again
 
 
-✨ Features:
-
-📚 Library & Grid Management:
-
-Lightning-Fast Caching: Automatically generates and saves tiny, high-speed thumbnails (using background threads) so massive folders load instantly.
-
-Persistent Hide System: Right-click to permanently banish junk folders, text files, or unwanted comics from your library view.
-
-Dynamic Navigation: Seamlessly jump in and out of folders directly from the Grid view with intuitive Up and Forward controls.
-
-Custom Covers: Right-click any comic or folder to assign a custom image, extract a specific page from inside the archive, or copy a cover from another comic.
-
-📋 The CBL Heuristic Engine:
-
-Smart Reading Lists: Import .cbl (Comic Book List) files and watch the app intelligently map your local files to the required issues.
-
-Advanced Name Parsing: Automatically handles messy archive formats (including URL-encoded characters, Novus release tags like (_02), and mismatched dates).
-
-The "Double Shield": Mathematically prevents Single Issues from stealing TPB/Omnibus slots, and applies lethal penalties to files with wildly inaccurate years.
-
-Missing Issue Tracker: Visually displays which issues you own and which you are missing. Clicking a missing issue instantly searches the web for it.
-
-🤖 AI Integration (Powered by Gemini 2.5):
-
-AI List Maker: Ask Gemini to build exhaustive, chronologically accurate reading orders for massive crossover events (e.g., "Marvel Civil War Main Event").
-
-AI Metadata Tagger: Paste a wiki URL or type a comic name, and Gemini will scrape the web to generate a perfect, ComicRack-compatible metadata payload.
-
-The Interrogator (Comic Chat): An integrated AI assistant that reads the context of your currently selected comic and answers deep-lore questions about the universe. Includes Edge TTS voice responses.
-
-Deep-Dive Summaries: Generates 500-word, highly detailed plot summaries and significance analyses for any issue.
-
-EPUB Export: Batch-generate AI summaries for entire runs and compile them into a readable EPUB book.
-
-🏷️ Intelligent Batch Tagger:
-
-Comic Vine Integration: Connects directly to the Comic Vine API to pull Characters, Teams, Locations, Story Arcs, Writers, and Artists.
-
-CBR to CBZ Conversion: Safely extracts legacy .cbr (RAR) archives and repackages them as universal .cbz (ZIP) files while injecting metadata.
-
-Forced Volume Locking: Paste a Comic Vine URL into the tagger to lock the engine to a specific volume database ID, bypassing fuzzy search errors entirely.
-
-Interactive Mode: Allows you to manually confirm matches and covers before altering files.
-
-🌐 Built-in Web Browser:
-
-GetComics Integration: A fully integrated PyQt6 WebEngine browser to hunt for missing issues.
-
-Ad-Silencer: Custom web page profiles actively suppress noisy javascript console logs.
-
-Native Downloader: Intercepts browser downloads and saves files directly to your library with visual progress bars.
-
-
-
-🛠️ Prerequisites & Installation:
-
-1. Run the exe and that’s t!
-
-or
-
-1. System Requirements
-
-Python 3.9+
-
-WinRAR / UnRAR: Required for handling .cbr files. Ensure UnRAR.exe is installed (default path: C:\Program Files\WinRAR\UnRAR.exe).
-
-External Reader (Optional): Designed to hook into external readers like YACReader.
-
-2. Python Dependencies
-
-Install the required Python libraries via pip:
-
-pip install PyQt6 PyQt6-WebEngine requests urllib3
-pip install google-genai edge-tts ebooklib markdown
-pip install rarfile patool
-
-
-3. API Keys
-
-To unlock the full potential of the app, you need two free API keys:
-
-Comic Vine API Key: Get one at Comic Vine API.
-
-Google Gemini API Key: Get one at Google AI Studio.
-
-Note: You can input these keys directly in the Settings tab of the application.
-
-🚀 How to Use
-
-Launch the App: Run python yourcomics.py (or whatever your main script is named).
-
-Add Libraries: Go to the Library tab on the left panel and click + Add Folder to link your comic hard drives.
-
-Set Up Settings: Navigate to the far-right Settings tab. Input your API keys, select your preferred AI Narrator voice, and link your external reader executable. (Restart the app to apply API keys).
-
-Tagging Comics:
-
-Single: Click a comic in the Grid, view its details, and click "Convert/Tag".
-
-Batch: Go to the Batch Tagger tab, add a folder, and let the engine scan and tag your entire collection automatically.
-
-Reading Lists: Drag and drop comics into the Reading tab, or use the List Maker to have AI generate a .cbl file for you.
-
-⚠️ Known Issues & Notes
-
-CBR Extraction Limits: Extracting .cbr files relies heavily on the rarfile and patoolib wrappers for your system's native UnRAR installation. If CBR conversions fail, ensure WinRAR is installed correctly.
-
-Metadata Overwrites: CBZ files are ZIP archives. The app safely rewrites the archive into a temporary memory stream when updating ComicInfo.xml to prevent file corruption.
-
-TTS Generation: Generating audio via edge-tts requires an active internet connection.
-
-Built with Python, PyQt6, and comic book love.
