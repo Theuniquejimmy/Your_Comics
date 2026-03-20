@@ -1969,7 +1969,7 @@ class NewReleasesTab(QWidget):
 
     def _render(self, groups):
         self._clear_all()
-        colours = {"dc": "#0476D0", "marvel": "#FF6B35", "other": "#44475a", "watched": "#bd93f9"}
+        colours = {"dc": "#0476D0", "marvel": "#ff0000", "other": "#44475a", "watched": "#bd93f9"}
         layouts = {"dc": self.dc_layout, "marvel": self.mv_layout, "other": self.oth_layout, "watched": self.wt_layout}
 
         current_by_url = {}
