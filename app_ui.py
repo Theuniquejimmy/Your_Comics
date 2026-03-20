@@ -1904,22 +1904,49 @@ class NewReleasesTab(QWidget):
                     lbl.setText("✅ " + text)
 
     def hideEvent(self, event):
-        for t in [self._fetch_thread, self._cover_thread, self._check_thread]:
-            if t and t.isRunning():
-                t.quit()
-                t.wait()
-        super().hideEvent(event)
+    """Safely stop threads when tab is hidden (prevents crash on minimize)"""
+    threads_to_stop = [
+        getattr(self, '_fetch_thread', None),
+        getattr(self, '_cover_thread', None),
+        getattr(self, '_check_thread', None)
+    ]
+    for t in threads_to_stop:
+        try:
+            if t is not None and hasattr(t, 'isRunning'):
+                if t.isRunning():
+                    t.quit()
+                    # Wait max 500ms for thread to finish gracefully
+                    if hasattr(t, 'wait'):
+                        t.wait(timeout=500)
+        except (RuntimeError, AttributeError) as e:
+            log.warning("Error stopping thread during hideEvent: %s", e)
+    super().hideEvent(event)
 
     def _clear_all(self):
-        if self._cover_thread and self._cover_thread.isRunning():
-            self._cover_thread.stop()
-            self._cover_thread.quit()
-            self._cover_thread.wait()
-        for lay in (self.dc_layout, self.mv_layout, self.oth_layout, self.wt_layout):
+    """Safely clear all layouts and stop threads"""
+    try:
+        if hasattr(self, '_cover_thread') and self._cover_thread:
+            if hasattr(self._cover_thread, 'isRunning') and self._cover_thread.isRunning():
+                if hasattr(self._cover_thread, 'stop'):
+                    self._cover_thread.stop()
+                self._cover_thread.quit()
+                if hasattr(self._cover_thread, 'wait'):
+                    self._cover_thread.wait(timeout=500)
+    except (RuntimeError, AttributeError) as e:
+        log.warning("Error stopping cover thread: %s", e)
+    
+    # Clear all layouts safely
+    for lay in (self.dc_layout, self.mv_layout, self.oth_layout, self.wt_layout):
+        try:
             while lay.count() > 1:
                 item = lay.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
+                if item and item.widget():
+                    try:
+                        item.widget().deleteLater()
+                    except RuntimeError:
+                        pass  # Widget already deleted
+        except (RuntimeError, AttributeError):
+            pass  # Layout already destroyed
 
     def _load_week(self):
         self._clear_all()
@@ -2003,10 +2030,30 @@ class NewReleasesTab(QWidget):
         for cat, entries in render_groups.items():
             lay = layouts[cat]
             border = colours[cat]
-            entries = sorted(entries, key=lambda e: (
-                0 if e.get("url", "") in self._followed else 1,
-                e.get("title", "").lower()
-            ))
+            def parse_date(date_str):
+    """Parse date string like 'Jan 15, 2025' or 'Jan 15' to comparable tuple"""
+    try:
+        # Handle various date formats
+        if not date_str or date_str.strip() == "":
+            return (9999, 12, 31)  # Put empty dates at the end
+        
+        # Try to parse the date
+        date_obj = datetime.datetime.strptime(date_str.strip(), "%b %d, %Y")
+        return (date_obj.year, date_obj.month, date_obj.day)
+    except (ValueError, AttributeError):
+        try:
+            # Try without year
+            date_obj = datetime.datetime.strptime(date_str.strip(), "%b %d")
+            today = datetime.date.today()
+            return (today.year, date_obj.month, date_obj.day)
+        except (ValueError, AttributeError):
+            return (9999, 12, 31)  # Invalid dates go to end
+
+entries = sorted(entries, key=lambda e: (
+    0 if e.get("url", "") in self._followed else 1,  # Followed first
+    parse_date(e.get("date", "")),                     # Then by date (newest first)
+    e.get("title", "").lower()                         # Then alphabetical
+))
             COLS = 3
             for row_idx in range(0, len(entries), COLS):
                 group = entries[row_idx:row_idx + COLS]
