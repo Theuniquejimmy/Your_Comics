@@ -1903,50 +1903,49 @@ class NewReleasesTab(QWidget):
                 if not text.startswith("✅ "):
                     lbl.setText("✅ " + text)
 
-    def hideEvent(self, event):
-    """Safely stop threads when tab is hidden (prevents crash on minimize)"""
-    threads_to_stop = [
-        getattr(self, '_fetch_thread', None),
-        getattr(self, '_cover_thread', None),
-        getattr(self, '_check_thread', None)
-    ]
-    for t in threads_to_stop:
-        try:
-            if t is not None and hasattr(t, 'isRunning'):
-                if t.isRunning():
-                    t.quit()
-                    # Wait max 500ms for thread to finish gracefully
-                    if hasattr(t, 'wait'):
-                        t.wait(timeout=500)
-        except (RuntimeError, AttributeError) as e:
-            log.warning("Error stopping thread during hideEvent: %s", e)
-    super().hideEvent(event)
+        def hideEvent(self, event):
+        """Safely stop threads when tab is hidden (prevents crash on minimize)"""
+        threads_to_stop = [
+            getattr(self, '_fetch_thread', None),
+            getattr(self, '_cover_thread', None),
+            getattr(self, '_check_thread', None)
+        ]
+        for t in threads_to_stop:
+            try:
+                if t is not None and hasattr(t, 'isRunning'):
+                    if t.isRunning():
+                        t.quit()
+                        if hasattr(t, 'wait'):
+                            t.wait(timeout=500)
+            except (RuntimeError, AttributeError) as e:
+                log.warning("Error stopping thread during hideEvent: %s", e)
+        super().hideEvent(event)
 
-    def _clear_all(self):
-    """Safely clear all layouts and stop threads"""
-    try:
-        if hasattr(self, '_cover_thread') and self._cover_thread:
-            if hasattr(self._cover_thread, 'isRunning') and self._cover_thread.isRunning():
-                if hasattr(self._cover_thread, 'stop'):
-                    self._cover_thread.stop()
-                self._cover_thread.quit()
-                if hasattr(self._cover_thread, 'wait'):
-                    self._cover_thread.wait(timeout=500)
-    except (RuntimeError, AttributeError) as e:
-        log.warning("Error stopping cover thread: %s", e)
-    
-    # Clear all layouts safely
-    for lay in (self.dc_layout, self.mv_layout, self.oth_layout, self.wt_layout):
+        def _clear_all(self):
+        """Safely clear all layouts and stop threads"""
         try:
-            while lay.count() > 1:
-                item = lay.takeAt(0)
-                if item and item.widget():
-                    try:
-                        item.widget().deleteLater()
-                    except RuntimeError:
-                        pass  # Widget already deleted
-        except (RuntimeError, AttributeError):
-            pass  # Layout already destroyed
+            if hasattr(self, '_cover_thread') and self._cover_thread:
+                if hasattr(self._cover_thread, 'isRunning') and self._cover_thread.isRunning():
+                    if hasattr(self._cover_thread, 'stop'):
+                        self._cover_thread.stop()
+                    self._cover_thread.quit()
+                    if hasattr(self._cover_thread, 'wait'):
+                        self._cover_thread.wait(timeout=500)
+        except (RuntimeError, AttributeError) as e:
+            log.warning("Error stopping cover thread: %s", e)
+        
+        # Clear all layouts safely
+        for lay in (self.dc_layout, self.mv_layout, self.oth_layout, self.wt_layout):
+            try:
+                while lay.count() > 1:
+                    item = lay.takeAt(0)
+                    if item and item.widget():
+                        try:
+                            item.widget().deleteLater()
+                        except RuntimeError:
+                            pass
+            except (RuntimeError, AttributeError):
+                pass
 
     def _load_week(self):
         self._clear_all()
