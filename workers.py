@@ -45,6 +45,43 @@ try:
 except ImportError:
     HAS_RAR = False
 
+# New Releases: disk cache for scaled cover thumbs (like grid thumb_*.jpg).
+_NR_THUMB_W, _NR_THUMB_H = 280, 420  # ~2× card 130×195 for HiDPI
+
+
+def gc_new_releases_thumb_path(url: str) -> str:
+    h = hashlib.md5((url or "").strip().encode("utf-8")).hexdigest()
+    return os.path.join(CACHE_DIR, f"gc_nr_{h}.jpg")
+
+
+def gc_new_releases_uncache_thumb(url: str) -> None:
+    try:
+        p = gc_new_releases_thumb_path(url)
+        if os.path.isfile(p):
+            os.remove(p)
+    except OSError:
+        pass
+
+
+def _scale_bytes_to_nr_thumb(image_bytes: bytes) -> bytes:
+    """Downscale og:image to a small JPEG for fast UI + disk cache."""
+    if not image_bytes:
+        return b""
+    img = QImage()
+    if not img.loadFromData(image_bytes):
+        return image_bytes
+    thumb = img.scaled(
+        _NR_THUMB_W,
+        _NR_THUMB_H,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    thumb.save(buf, "JPG", 85)
+    return ba.data()
+
 
 class MiniImageFetcher(QThread):
     image_ready = pyqtSignal(bytes)
@@ -61,26 +98,218 @@ class MiniImageFetcher(QThread):
             self.image_ready.emit(b"")
 
 
+def _comicvine_issue_search(query: str) -> list:
+    """Shared search logic: parse query, find volumes, filter issues, score and return."""
+    headers = {"User-Agent": "YourComicsApp/1.0"}
+    parsed = parse_comic_filename_full(query.strip())
+    series = parsed['series']
+    issue = parsed['issue']
+    year_str = parsed['year']
+    subtitle = parsed['subtitle']
+    vol_num = parsed['vol_num']
+
+    if not series:
+        series = query.strip()
+        issue = ""
+        year_str = ""
+        subtitle = ""
+        vol_num = ""
+
+    final_results = []
+    target_vol_id = None
+
+    try:
+        vol_query = urllib.parse.quote(series)
+        vol_combined = {}
+
+        filter_url = (
+            f"https://comicvine.gamespot.com/api/volumes/"
+            f"?api_key={COMIC_VINE_KEY}&format=json"
+            f"&filter=name:{vol_query}&limit=30"
+            f"&field_list=id,name,start_year,count_of_issues,publisher,api_detail_url"
+        )
+        time.sleep(1.5)
+        r1 = requests.get(filter_url, headers=headers, timeout=10).json()
+        if r1.get('error') == 'OK':
+            for v in r1.get('results', []):
+                vol_combined[v['id']] = v
+
+        time.sleep(1.0)
+
+        search_url = (
+            f"https://comicvine.gamespot.com/api/search/"
+            f"?api_key={COMIC_VINE_KEY}&format=json"
+            f"&resources=volume&query={vol_query}&limit=20"
+        )
+        r2 = requests.get(search_url, headers=headers, timeout=10).json()
+        if r2.get('error') == 'OK':
+            for v in r2.get('results', []):
+                vol_combined[v['id']] = v
+
+        for _the_variant in _the_variants(series)[1:]:
+            if _the_variant.lower() != series.lower():
+                time.sleep(0.5)
+                _tq = urllib.parse.quote(_the_variant)
+                _tr = requests.get(
+                    f"https://comicvine.gamespot.com/api/volumes/"
+                    f"?api_key={COMIC_VINE_KEY}&format=json"
+                    f"&filter=name:{_tq}&limit=20"
+                    f"&field_list=id,name,start_year,count_of_issues,publisher,api_detail_url",
+                    headers=headers, timeout=10
+                ).json()
+                if _tr.get('error') == 'OK':
+                    for v in _tr.get('results', []):
+                        vol_combined[v['id']] = v
+
+        if subtitle:
+            time.sleep(1.0)
+            full_query = urllib.parse.quote(f"{series} {subtitle}")
+            r3 = requests.get(
+                f"https://comicvine.gamespot.com/api/search/"
+                f"?api_key={COMIC_VINE_KEY}&format=json"
+                f"&resources=volume&query={full_query}&limit=10",
+                headers=headers, timeout=10
+            ).json()
+            if r3.get('error') == 'OK':
+                for v in r3.get('results', []):
+                    vol_combined[v['id']] = v
+            for extra_kw in ('deluxe', 'omnibus'):
+                triggers = [
+                    re.match(r'(?i)^book\s*\d+$', subtitle),
+                    extra_kw in subtitle.lower(),
+                ]
+                if any(triggers):
+                    time.sleep(0.8)
+                    eq = urllib.parse.quote(f"{series} {extra_kw}")
+                    r4 = requests.get(
+                        f"https://comicvine.gamespot.com/api/search/"
+                        f"?api_key={COMIC_VINE_KEY}&format=json"
+                        f"&resources=volume&query={eq}&limit=10",
+                        headers=headers, timeout=10
+                    ).json()
+                    if r4.get('error') == 'OK':
+                        for v in r4.get('results', []):
+                            vol_combined[v['id']] = v
+
+        vol_results = list(vol_combined.values())
+        if vol_results:
+            vol_results.sort(
+                key=lambda v: _score_volume(v, series, issue, year_str, subtitle, vol_num),
+                reverse=True
+            )
+            target_vol_id = vol_results[0]['id']
+
+        if target_vol_id:
+            issue_filter = f"volume:{target_vol_id}"
+            if issue:
+                issue_filter += f",issue_number:{issue}"
+
+            issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
+
+            time.sleep(1.5)
+            issue_response = requests.get(issue_url, headers=headers, timeout=10)
+            issue_data = issue_response.json()
+
+            if issue_data.get('error') == 'OK' and issue_data.get('number_of_total_results', 0) > 0:
+                final_results = issue_data['results']
+
+        if parsed.get('is_tpb'):
+            tpb_query = urllib.parse.quote(
+                f"{series} {subtitle}".strip() if subtitle else series
+            )
+            tpb_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={tpb_query}&limit=15&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
+            time.sleep(1.5)
+            r3 = requests.get(tpb_url, headers=headers, timeout=10).json()
+            if r3.get('error') == 'OK':
+                existing_ids = {r['id'] for r in final_results}
+                for r in r3.get('results', []):
+                    if r['id'] not in existing_ids:
+                        final_results.append(r)
+        elif not final_results:
+            search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={urllib.parse.quote(query)}&limit=10&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
+            time.sleep(1.5)
+            response = requests.get(search_url, headers=headers, timeout=10)
+            fuzzy_data = response.json()
+            if fuzzy_data.get('error') == 'OK':
+                existing_ids = {r['id'] for r in final_results}
+                for r in fuzzy_data.get('results', []):
+                    if r['id'] not in existing_ids:
+                        final_results.append(r)
+
+    except Exception as e:
+        log.warning("Manual Search Error: %s", e)
+
+    def _score_issue(r):
+        score = 0
+        vol = r.get('volume', {}) or {}
+        vol_name = str(vol.get('name') or '').lower()
+        issue_name = str(r.get('name') or '').lower()
+        issue_num = str(r.get('issue_number') or '')
+
+        lang = str(r.get('language') or '').lower()
+        if lang and lang != 'english':
+            score -= 80
+
+        _vn = _norm_vol_name(vol_name)
+        _wn = _norm_vol_name(series)
+        if _vn and _vn == _wn:
+            score += 50
+        elif _wn and _wn in _vn:
+            score += 25
+        elif _wn and _vn in _wn:
+            score += 15
+        if year_str:
+            result_year = str(r.get('cover_date', ''))[:4]
+            if result_year == year_str:
+                score += 25
+            elif result_year and result_year != year_str:
+                score -= 20
+
+        if parsed.get('is_tpb'):
+            if target_vol_id and str(vol.get('id', '')) == str(target_vol_id):
+                score += 30
+            if re.search(r'\bvol\.?\s*\d', issue_name, re.I):
+                score += 200
+            if subtitle and subtitle.lower() in issue_name:
+                score += 150
+            if vol_num and issue_num == vol_num:
+                score += 100
+            try:
+                if int(r.get('page_count') or 0) > 100:
+                    score += 120
+            except (ValueError, TypeError):
+                pass
+            try:
+                n = int(issue_num)
+                if n > 50:
+                    score -= 80
+                elif n > 20:
+                    score -= 40
+            except (ValueError, TypeError):
+                pass
+        else:
+            if target_vol_id and str(vol.get('id', '')) == str(target_vol_id):
+                score += 60
+            if issue and issue_num == issue:
+                score += 80
+            if subtitle and subtitle.lower() in issue_name:
+                score += 40
+
+        return score
+
+    final_results.sort(key=_score_issue, reverse=True)
+    return final_results
+
+
 class MiniVineSearcher(QThread):
     results_ready = pyqtSignal(list)
 
     def __init__(self, query):
         super().__init__()
-        self.query = query
+        self.query = query.strip()
 
     def run(self):
-        safe_query = urllib.parse.quote(self.query)
-        url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={safe_query}"
-
-        try:
-            headers = {"User-Agent": "YourComicsApp/1.0"}
-            resp = requests.get(url, headers=headers, timeout=10).json()
-            if resp.get('error') == 'OK':
-                self.results_ready.emit(resp.get('results', []))
-            else:
-                self.results_ready.emit([])
-        except Exception:
-            self.results_ready.emit([])
+        self.results_ready.emit(_comicvine_issue_search(self.query))
 
 
 class MiniAITaggerThread(QThread):
@@ -218,7 +447,8 @@ class ComicVineIssueThread(QThread):
 
             if data.get('error') == 'OK':
                 if self.direct_api_url:
-                    self.issue_ready.emit(data.get('results', {}))
+                    issue_data = data.get('result') or (data.get('results') or [{}])[0]
+                    self.issue_ready.emit(issue_data if isinstance(issue_data, dict) else {})
                 else:
                     results = data.get('results', [])
                     self.issue_ready.emit(results[0] if results else {})
@@ -622,206 +852,7 @@ class ComicVineIssueSearchThread(QThread):
         self.query = query.strip()
 
     def run(self):
-        headers = {"User-Agent": "YourComicsApp/1.0"}
-
-        parsed = parse_comic_filename_full(self.query)
-        series = parsed['series']
-        issue = parsed['issue']
-        year_str = parsed['year']
-        subtitle = parsed['subtitle']
-        vol_num = parsed['vol_num']
-
-        if not series:
-            series = self.query
-            issue = ""
-            year_str = ""
-            subtitle = ""
-            vol_num = ""
-
-        final_results = []
-        target_vol_id = None
-
-        try:
-            vol_query = urllib.parse.quote(series)
-            vol_combined = {}
-
-            filter_url = (
-                f"https://comicvine.gamespot.com/api/volumes/"
-                f"?api_key={COMIC_VINE_KEY}&format=json"
-                f"&filter=name:{vol_query}&limit=30"
-                f"&field_list=id,name,start_year,count_of_issues,publisher,api_detail_url"
-            )
-            time.sleep(1.5)
-            r1 = requests.get(filter_url, headers=headers, timeout=10).json()
-            if r1.get('error') == 'OK':
-                for v in r1.get('results', []):
-                    vol_combined[v['id']] = v
-
-            time.sleep(1.0)
-
-            search_url = (
-                f"https://comicvine.gamespot.com/api/search/"
-                f"?api_key={COMIC_VINE_KEY}&format=json"
-                f"&resources=volume&query={vol_query}&limit=20"
-            )
-            r2 = requests.get(search_url, headers=headers, timeout=10).json()
-            if r2.get('error') == 'OK':
-                for v in r2.get('results', []):
-                    vol_combined[v['id']] = v
-
-            for _the_variant in _the_variants(series)[1:]:
-                if _the_variant.lower() != series.lower():
-                    time.sleep(0.5)
-                    _tq = urllib.parse.quote(_the_variant)
-                    _tr = requests.get(
-                        f"https://comicvine.gamespot.com/api/volumes/"
-                        f"?api_key={COMIC_VINE_KEY}&format=json"
-                        f"&filter=name:{_tq}&limit=20"
-                        f"&field_list=id,name,start_year,count_of_issues,publisher,api_detail_url",
-                        headers=headers, timeout=10
-                    ).json()
-                    if _tr.get('error') == 'OK':
-                        for v in _tr.get('results', []):
-                            vol_combined[v['id']] = v
-
-            if subtitle:
-                time.sleep(1.0)
-                full_query = urllib.parse.quote(f"{series} {subtitle}")
-                r3 = requests.get(
-                    f"https://comicvine.gamespot.com/api/search/"
-                    f"?api_key={COMIC_VINE_KEY}&format=json"
-                    f"&resources=volume&query={full_query}&limit=10",
-                    headers=headers, timeout=10
-                ).json()
-                if r3.get('error') == 'OK':
-                    for v in r3.get('results', []):
-                        vol_combined[v['id']] = v
-                for extra_kw in ('deluxe', 'omnibus'):
-                    triggers = [
-                        re.match(r'(?i)^book\s*\d+$', subtitle),
-                        extra_kw in subtitle.lower(),
-                    ]
-                    if any(triggers):
-                        time.sleep(0.8)
-                        eq = urllib.parse.quote(f"{series} {extra_kw}")
-                        r4 = requests.get(
-                            f"https://comicvine.gamespot.com/api/search/"
-                            f"?api_key={COMIC_VINE_KEY}&format=json"
-                            f"&resources=volume&query={eq}&limit=10",
-                            headers=headers, timeout=10
-                        ).json()
-                        if r4.get('error') == 'OK':
-                            for v in r4.get('results', []):
-                                vol_combined[v['id']] = v
-
-            vol_results = list(vol_combined.values())
-            if vol_results:
-                vol_results.sort(
-                    key=lambda v: _score_volume(v, series, issue, year_str, subtitle, vol_num),
-                    reverse=True
-                )
-                target_vol_id = vol_results[0]['id']
-
-            if target_vol_id:
-                issue_filter = f"volume:{target_vol_id}"
-                if issue:
-                    issue_filter += f",issue_number:{issue}"
-
-                issue_url = f"https://comicvine.gamespot.com/api/issues/?api_key={COMIC_VINE_KEY}&format=json&filter={urllib.parse.quote(issue_filter)}&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
-
-                time.sleep(1.5)
-                issue_response = requests.get(issue_url, headers=headers, timeout=10)
-                issue_data = issue_response.json()
-
-                if issue_data.get('error') == 'OK' and issue_data.get('number_of_total_results', 0) > 0:
-                    final_results = issue_data['results']
-
-            if parsed.get('is_tpb'):
-                tpb_query = urllib.parse.quote(
-                    f"{series} {subtitle}".strip() if subtitle else series
-                )
-                tpb_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={tpb_query}&limit=15&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
-                time.sleep(1.5)
-                r3 = requests.get(tpb_url, headers=headers, timeout=10).json()
-                if r3.get('error') == 'OK':
-                    existing_ids = {r['id'] for r in final_results}
-                    for r in r3.get('results', []):
-                        if r['id'] not in existing_ids:
-                            final_results.append(r)
-            elif not final_results:
-                search_url = f"https://comicvine.gamespot.com/api/search/?api_key={COMIC_VINE_KEY}&format=json&resources=issue&query={urllib.parse.quote(self.query)}&limit=10&field_list=id,name,issue_number,cover_date,volume,api_detail_url,page_count,image,language"
-                time.sleep(1.5)
-                response = requests.get(search_url, headers=headers, timeout=10)
-                fuzzy_data = response.json()
-                if fuzzy_data.get('error') == 'OK':
-                    existing_ids = {r['id'] for r in final_results}
-                    for r in fuzzy_data.get('results', []):
-                        if r['id'] not in existing_ids:
-                            final_results.append(r)
-
-        except Exception as e:
-            log.warning("Manual Search Error: %s", e)
-
-        def _score_issue(r):
-            score = 0
-            vol = r.get('volume', {}) or {}
-            vol_name = str(vol.get('name') or '').lower()
-            issue_name = str(r.get('name') or '').lower()
-            issue_num = str(r.get('issue_number') or '')
-
-            lang = str(r.get('language') or '').lower()
-            if lang and lang != 'english':
-                score -= 80
-
-            _vn = _norm_vol_name(vol_name)
-            _wn = _norm_vol_name(series)
-            if _vn and _vn == _wn:
-                score += 50
-            elif _wn and _wn in _vn:
-                score += 25
-            elif _wn and _vn in _wn:
-                score += 15
-            if year_str:
-                result_year = str(r.get('cover_date', ''))[:4]
-                if result_year == year_str:
-                    score += 25
-                elif result_year and result_year != year_str:
-                    score -= 20
-
-            if parsed.get('is_tpb'):
-                if target_vol_id and str(vol.get('id', '')) == str(target_vol_id):
-                    score += 30
-                if re.search(r'\bvol\.?\s*\d', issue_name, re.I):
-                    score += 200
-                if subtitle and subtitle.lower() in issue_name:
-                    score += 150
-                if vol_num and issue_num == vol_num:
-                    score += 100
-                try:
-                    if int(r.get('page_count') or 0) > 100:
-                        score += 120
-                except (ValueError, TypeError):
-                    pass
-                try:
-                    n = int(issue_num)
-                    if n > 50:
-                        score -= 80
-                    elif n > 20:
-                        score -= 40
-                except (ValueError, TypeError):
-                    pass
-            else:
-                if target_vol_id and str(vol.get('id', '')) == str(target_vol_id):
-                    score += 60
-                if issue and issue_num == issue:
-                    score += 80
-                if subtitle and subtitle.lower() in issue_name:
-                    score += 40
-
-            return score
-
-        final_results.sort(key=_score_issue, reverse=True)
-        self.results_ready.emit(final_results)
+        self.results_ready.emit(_comicvine_issue_search(self.query))
 
 
 class ImageDownloadThread(QThread):
@@ -1364,6 +1395,7 @@ class GCSitemapThread(QThread):
             groups = {"dc": [], "marvel": [], "other": []}
             seen_urls = set()
             seen_titles = set()
+            seq = 0
 
             def _publisher_bucket(section: str, title: str) -> str:
                 s = (section or "").lower().strip()
@@ -1406,8 +1438,16 @@ class GCSitemapThread(QThread):
                 seen_urls.add(url_norm)
                 seen_titles.add(title_norm)
 
-                entry = {"title": title_clean, "url": url, "date": date_str}
-                groups[_publisher_bucket(section, title_clean)].append(entry)
+                seq += 1
+                bucket = _publisher_bucket(section, title_clean)
+                entry = {
+                    "title": title_clean,
+                    "url": url,
+                    "date": date_str,
+                    "seq": seq,
+                    "bucket": bucket,
+                }
+                groups[bucket].append(entry)
 
             self.results_ready.emit(groups)
         except Exception as e:
@@ -1417,10 +1457,12 @@ class GCSitemapThread(QThread):
 class GCCoverThread(QThread):
     cover_ready = pyqtSignal(str, bytes)
 
-    def __init__(self, entries):
+    def __init__(self, entries, request_timeout=4, delay_between=0.1):
         super().__init__()
         self.entries = entries
         self.is_running = True
+        self._timeout = float(request_timeout)
+        self._delay_between = float(delay_between)
 
     def run(self):
         hdrs = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/123.0"}
@@ -1429,15 +1471,31 @@ class GCCoverThread(QThread):
                 break
             url = entry.get("url", "")
             try:
-                resp = requests.get(url, headers=hdrs, timeout=10)
+                # Disk thumbnail cache (same idea as grid thumb_*.jpg)
+                thumb_path = gc_new_releases_thumb_path(url)
+                if os.path.isfile(thumb_path):
+                    try:
+                        with open(thumb_path, "rb") as tf:
+                            cached = tf.read()
+                        if cached:
+                            self.cover_ready.emit(url, cached)
+                            time.sleep(self._delay_between)
+                            continue
+                    except OSError:
+                        pass
+
+                resp = requests.get(url, headers=hdrs, timeout=self._timeout)
                 html = resp.content.decode("utf-8", errors="replace")
                 img_url = ""
                 # Support property/name ordering, single quotes, and common fallbacks.
                 patterns = [
                     r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']',
                     r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']',
+                    r'<meta[^>]+property=["\']og:image:secure_url["\'][^>]+content=["\']([^"\']+)["\']',
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image:secure_url["\']',
                     r'<meta[^>]+name=["\']twitter:image["\'][^>]+content=["\']([^"\']+)["\']',
                     r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image["\']',
+                    r'<link[^>]+rel=["\']image_src["\'][^>]+href=["\']([^"\']+)["\']',
                 ]
                 for pat in patterns:
                     m = re.search(pat, html, flags=re.IGNORECASE)
@@ -1445,13 +1503,23 @@ class GCCoverThread(QThread):
                         img_url = m.group(1)
                         break
                 if img_url:
-                    img_resp = requests.get(img_url, headers=hdrs, timeout=10)
-                    self.cover_ready.emit(url, img_resp.content)
+                    img_hdrs = dict(hdrs)
+                    img_hdrs["Referer"] = url
+                    img_resp = requests.get(img_url, headers=img_hdrs, timeout=self._timeout)
+                    raw = img_resp.content
+                    scaled = _scale_bytes_to_nr_thumb(raw)
+                    if scaled:
+                        try:
+                            with open(thumb_path, "wb") as out:
+                                out.write(scaled)
+                        except OSError:
+                            pass
+                    self.cover_ready.emit(url, scaled or raw)
                 else:
                     self.cover_ready.emit(url, b"")
             except Exception:
                 self.cover_ready.emit(url, b"")
-            time.sleep(0.4)
+            time.sleep(self._delay_between)
 
     def stop(self):
         self.is_running = False

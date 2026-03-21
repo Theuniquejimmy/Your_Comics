@@ -44,7 +44,6 @@ from utils import (
 )
 from workers import (
     MiniImageFetcher,
-    MiniVineSearcher,
     MiniAITaggerThread,
     ComicVineIssueThread,
     ComicConverterThread,
@@ -66,6 +65,8 @@ from workers import (
     GetComicsCheckThread,
     GCSitemapThread,
     GCCoverThread,
+    gc_new_releases_thumb_path,
+    gc_new_releases_uncache_thumb,
     BatchTaggerThread,
     HAS_RAR,
 )
@@ -75,6 +76,17 @@ from widgets import (
     DraggableSearchList,
     HoverSummaryList,
 )
+
+# Dracula-themed message boxes (default QMessageBox is light on many platforms).
+DRACULA_MSGBOX_QSS = """
+    QMessageBox { background-color: #282a36; color: #f8f8f2; }
+    QMessageBox QLabel { color: #f8f8f2; }
+    QPushButton {
+        background-color: #44475a; color: #f8f8f2;
+        padding: 5px 15px; border-radius: 3px; font-weight: bold;
+    }
+    QPushButton:hover { background-color: #6272a4; }
+"""
 
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -253,9 +265,24 @@ class BatchCoverMatchDialog(QDialog):
         self.accept_btn.setEnabled(False)
         self.remote_cover_label.setText("Waiting for results...")
 
-        self.search_thread = MiniVineSearcher(query)
-        self.search_thread.results_ready.connect(self.on_search_done)
-        self.search_thread.start()
+        m = re.search(r'4000-\d+', query) if 'comicvine.gamespot.com' in query.lower() else None
+        if m:
+            issue_id = m.group(0)
+            api_url = f"https://comicvine.gamespot.com/api/issue/{issue_id}/"
+            self.search_thread = ComicVineIssueThread(direct_api_url=api_url)
+            self.search_thread.issue_ready.connect(self._on_direct_issue_loaded)
+            self.search_thread.start()
+        else:
+            self.search_thread = ComicVineIssueSearchThread(query)
+            self.search_thread.results_ready.connect(self.on_search_done)
+            self.search_thread.start()
+
+    def _on_direct_issue_loaded(self, issue_data):
+        self.search_thread = None
+        self.search_btn.setEnabled(True)
+        results = [issue_data] if issue_data else []
+        self.results = results
+        self.populate_list(results)
 
     def on_search_done(self, new_results):
         self.search_btn.setEnabled(True)
@@ -266,6 +293,7 @@ class BatchCoverMatchDialog(QDialog):
         self.results_list.clear()
         if not results:
             self.results_list.addItem("❌ No issues found.")
+            self.results_list.addItem("Use 🤖 Add AI Info below to generate metadata.")
             return
 
         for issue in results:
@@ -1709,6 +1737,7 @@ class NewReleasesTab(QWidget):
         self._current_week  = self._this_wednesday()
         self._fetch_thread  = None
         self._cover_thread  = None
+        self._single_cover_threads = []  # one-off GCCoverThread for manual refresh
         self._check_thread  = None
         self._last_results  = {}
         self._cover_cache   = {}   # article_url -> bytes
@@ -1716,22 +1745,73 @@ class NewReleasesTab(QWidget):
         self._followed      = {}   # url -> {title}
         self._downloaded    = set()  # urls of successfully downloaded articles
         self._follow_collections = bool(APP_SETTINGS.get("follow_collections", False))
+        self._auto_followed_urls = set()  # urls added by the bulk "follow collections" toggle
+        self._active_groups = {}
+        self._render_groups = {}
+        self._copied_page_links = set()
+        self._hoster_downloaded = set()
+        self._cover_tab_inflight = None  # category currently being covered
+
+        # Persist copy / hoster indicators (used for green check on titles).
+        # Use absolute paths so files are found regardless of cwd on restart.
+        _nr_dir = os.path.dirname(os.path.abspath(__file__))
+        self._copied_file = os.path.join(_nr_dir, "copied_page_links.json")
+        self._hoster_file = os.path.join(_nr_dir, "hoster_downloaded.json")
+        self._cleared_watch_file = os.path.join(_nr_dir, "cleared_from_watched_urls.json")
+        self._cleared_watch_urls = set()
+        _n = self._norm_gc_url
+        try:
+            if os.path.exists(self._copied_file):
+                with open(self._copied_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, list):
+                        self._copied_page_links = {_n(str(x)) for x in raw if _n(str(x))}
+        except Exception:
+            self._copied_page_links = set()
+        try:
+            if os.path.exists(self._hoster_file):
+                with open(self._hoster_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, list):
+                        self._hoster_downloaded = {_n(str(x)) for x in raw if _n(str(x))}
+        except Exception:
+            self._hoster_downloaded = set()
+        try:
+            if os.path.exists(self._cleared_watch_file):
+                with open(self._cleared_watch_file, "r", encoding="utf-8") as f:
+                    raw = json.load(f)
+                    if isinstance(raw, list):
+                        self._cleared_watch_urls = {_n(str(x)) for x in raw if _n(str(x))}
+        except Exception:
+            self._cleared_watch_urls = set()
 
         try:
             if os.path.exists(FOLLOWED_SERIES_FILE):
                 with open(FOLLOWED_SERIES_FILE) as f:
                     saved = json.load(f)
-                    # Support old vol_id keys and new url keys
-                    self._followed = saved if isinstance(saved, dict) else {}
+                    norm = {}
+                    if isinstance(saved, dict):
+                        for k, v in saved.items():
+                            if isinstance(v, dict):
+                                norm[k] = {
+                                    "title": v.get("title", "") or str(k),
+                                    "date": v.get("date", "") or "",
+                                }
+                            else:
+                                norm[k] = {"title": str(v) if v else str(k), "date": ""}
+                    self._followed = norm
         except Exception:
             self._followed = {}
 
         # Load downloaded set
-        self._dl_file = "downloaded_comics.json"
+        self._dl_file = os.path.join(_nr_dir, "downloaded_comics.json")
         try:
             if os.path.exists(self._dl_file):
                 with open(self._dl_file) as f:
-                    self._downloaded = set(json.load(f))
+                    raw = json.load(f)
+                self._downloaded = {_n(str(x)) for x in (raw or []) if _n(str(x))}
+            else:
+                self._downloaded = set()
         except Exception:
             self._downloaded = set()
 
@@ -1786,12 +1866,37 @@ class NewReleasesTab(QWidget):
         tabs_header.addWidget(tabs_title)
         tabs_header.addStretch()
 
+        self.watched_filter = QComboBox()
+        self.watched_filter.addItems(["Watched: All", "Watched: Issues only", "Watched: Collections only"])
+        self.watched_filter.setCurrentIndex(0)
+        self.watched_filter.setStyleSheet(
+            "QComboBox { background:#21222c; color:#f8f8f2; border:1px solid #44475a; padding:4px 8px; }"
+        )
+        self.watched_filter.currentIndexChanged.connect(self._on_watched_filter_changed)
+        tabs_header.addWidget(self.watched_filter)
+
+        self.clear_downloaded_btn = QPushButton("Clear Downloaded")
+        self.clear_downloaded_btn.setStyleSheet(
+            "background:#44475a; color:#f8f8f2; padding:4px 10px; border-radius:4px; font-size:11px;"
+        )
+        self.clear_downloaded_btn.clicked.connect(self._clear_downloaded_from_followed)
+        tabs_header.addWidget(self.clear_downloaded_btn)
+
+        follow_col_wrap = QWidget()
+        follow_col_v = QVBoxLayout(follow_col_wrap)
+        follow_col_v.setContentsMargins(0, 0, 0, 0)
+        follow_col_v.setSpacing(2)
         self.follow_col_cb = QCheckBox("📚 Follow all Collections (omnibus, TPB, vol., etc.)")
         self.follow_col_cb.setChecked(self._follow_collections)
         self.follow_col_cb.setStyleSheet(
             "color:#bd93f9; font-size:11px; font-weight:bold; padding:4px;")
         self.follow_col_cb.toggled.connect(self._on_follow_collections_toggled)
-        tabs_header.addWidget(self.follow_col_cb)
+        follow_col_v.addWidget(self.follow_col_cb)
+        copy_link_hint = QLabel("Right click to copy link address")
+        copy_link_hint.setStyleSheet("color:#6272a4; font-size:9px; background:transparent;")
+        copy_link_hint.setWordWrap(True)
+        follow_col_v.addWidget(copy_link_hint)
+        tabs_header.addWidget(follow_col_wrap)
         layout.addLayout(tabs_header)
 
         # Three publisher sub-tabs
@@ -1802,12 +1907,15 @@ class NewReleasesTab(QWidget):
         self.dc_scroll,  self.dc_layout  = self._make_scroll()
         self.mv_scroll,  self.mv_layout  = self._make_scroll()
         self.oth_scroll, self.oth_layout = self._make_scroll()
+        self.col_scroll, self.col_layout = self._make_scroll()
         self.wt_scroll,  self.wt_layout  = self._make_scroll()
         self.pub_tabs.addTab(self.dc_scroll,  "DC Comics")
         self.pub_tabs.addTab(self.mv_scroll,  "Marvel")
 
         self.pub_tabs.addTab(self.oth_scroll, "Others")
+        self.pub_tabs.addTab(self.col_scroll, "Collections")
         self.pub_tabs.addTab(self.wt_scroll,  "Watched")
+        self.pub_tabs.currentChanged.connect(self._on_pub_tab_changed)
         layout.addWidget(self.pub_tabs, stretch=1)
 
         self.status_lbl = QLabel("Loading…")
@@ -1832,6 +1940,215 @@ class NewReleasesTab(QWidget):
         lay.addStretch()
         scroll.setWidget(container)
         return scroll, lay
+
+    @staticmethod
+    def _norm_gc_url(u: str) -> str:
+        """Normalize GetComics URL for consistent comparison (feed uses getcomics.org)."""
+        u = (u or "").strip().rstrip("/")
+        if not u:
+            return ""
+        lower = u.lower()
+        if "getcomics.info" in lower:
+            u = re.sub(r"getcomics\.info", "getcomics.org", u, flags=re.IGNORECASE)
+        return u
+
+    def _is_url_completed(self, url: str) -> bool:
+        """True if this URL is in downloaded, copied, or hoster sets (shows check in all sections)."""
+        if not url:
+            return False
+        un = self._norm_gc_url(url)
+        raw = (url or "").strip().rstrip("/")
+        # Check normalized, raw, and domain swap (getcomics.org <-> getcomics.info)
+        variants = {un, raw}
+        if un:
+            variants.add(re.sub(r"getcomics\.org", "getcomics.info", un, flags=re.IGNORECASE))
+            variants.add(re.sub(r"getcomics\.info", "getcomics.org", un, flags=re.IGNORECASE))
+        for s in (self._downloaded, self._copied_page_links, self._hoster_downloaded):
+            if any(v and v in s for v in variants):
+                return True
+        return False
+
+    def _save_cleared_watch_urls(self):
+        try:
+            with open(self._cleared_watch_file, "w", encoding="utf-8") as f:
+                json.dump(sorted(self._cleared_watch_urls), f, indent=2)
+        except Exception as _e:
+            log.warning("Could not save cleared watch list: %s", _e)
+
+    def _nr_information(self, title: str, text: str):
+        msg = QMessageBox(self)
+        msg.setWindowTitle(title)
+        msg.setIcon(QMessageBox.Icon.Information)
+        msg.setText(text)
+        msg.setStyleSheet(DRACULA_MSGBOX_QSS)
+        msg.exec()
+
+    def _watched_entries_filtered(self, groups):
+        """Watched list entries as shown under the current filter (matches Watched tab)."""
+        groups = groups or {}
+        dc_issues = [e for e in groups.get("dc", []) if not self._is_collection(e.get("title", ""))]
+        mv_issues = [e for e in groups.get("marvel", []) if not self._is_collection(e.get("title", ""))]
+        oth_issues = [e for e in groups.get("other", []) if not self._is_collection(e.get("title", ""))]
+        col_entries = [
+            e for e in (groups.get("dc", []) + groups.get("marvel", []) + groups.get("other", []))
+            if self._is_collection(e.get("title", ""))
+        ]
+        week_order = dc_issues + mv_issues + oth_issues + col_entries
+        week_urls = {e.get("url", "") for e in week_order if e.get("url", "")}
+
+        _n = self._norm_gc_url
+        watched_entries = []
+        for e in week_order:
+            u = e.get("url", "")
+            if u and u in self._followed and _n(u) not in self._cleared_watch_urls:
+                watched_entries.append(e)
+        for u, meta in self._followed.items():
+            if not isinstance(u, str) or not u.startswith("http"):
+                continue
+            if u in week_urls or _n(u) in self._cleared_watch_urls:
+                continue
+            md = meta if isinstance(meta, dict) else {"title": str(meta), "date": ""}
+            watched_entries.append({
+                "title": md.get("title", u),
+                "url": u,
+                "date": md.get("date", ""),
+                "_outside_week": True,
+            })
+
+        def _watched_sort_key(e):
+            ds = str(e.get("date", "") or "").strip()
+            try:
+                d = datetime.datetime.strptime(ds, "%B %d, %Y").date()
+                return (0, -d.toordinal(), str(e.get("title", "")).lower())
+            except Exception:
+                return (1, 0, str(e.get("title", "")).lower())
+
+        watched_entries.sort(key=_watched_sort_key)
+        watched_mode = self.watched_filter.currentIndex() if hasattr(self, "watched_filter") else 0
+        if watched_mode == 1:
+            watched_entries = [e for e in watched_entries if not self._is_collection(e.get("title", ""))]
+        elif watched_mode == 2:
+            watched_entries = [e for e in watched_entries if self._is_collection(e.get("title", ""))]
+        return watched_entries
+
+    def _cat_for_tab_index(self, idx: int) -> str:
+        # Keep in sync with tab order.
+        if idx == 0:
+            return "dc"
+        if idx == 1:
+            return "marvel"
+        if idx == 2:
+            return "other"
+        if idx == 3:
+            return "collections"
+        return "watched"
+
+    def _on_pub_tab_changed(self, idx: int):
+        # Priority-loading: switch cover fetching to match the selected tab.
+        self._start_cover_loading_for_tab(idx)
+
+    def _on_watched_filter_changed(self, _idx: int):
+        if self._last_results:
+            self._render(self._last_results)
+            if self._cat_for_tab_index(self.pub_tabs.currentIndex()) == "watched":
+                self._start_cover_loading_for_tab(self.pub_tabs.currentIndex())
+
+    def _clear_downloaded_from_followed(self):
+        if not self._followed:
+            return
+        _n = self._norm_gc_url
+        to_remove = [
+            u for u in self._followed.keys()
+            if _n(u) in self._downloaded
+            or _n(u) in self._copied_page_links
+            or _n(u) in self._hoster_downloaded
+        ]
+        if not to_remove:
+            self._nr_information(
+                "Clear Downloaded",
+                "No completed items in Watched (download, copy link, or hoster).",
+            )
+            return
+        for u in to_remove:
+            self._followed.pop(u, None)
+            self._auto_followed_urls.discard(u)
+            self._cleared_watch_urls.add(_n(u))
+            # Keep _downloaded, _copied_page_links, _hoster_downloaded intact so check marks
+            # remain in DC/Marvel/Others sections (only remove from Watched list).
+        self._save_followed()
+        self._save_cleared_watch_urls()
+        if self._last_results:
+            self._render(self._last_results)
+        self._update_watched_badge()
+
+    def _watch_key(self, title: str) -> str:
+        """Normalize a release title to a stable series key for follow carry-over."""
+        t = html.unescape(str(title or "")).lower()
+        t = re.sub(r'\(\d{4}\)', '', t)                     # drop trailing year
+        t = re.sub(r'#\s*\d+(\.\d+)?\b', '', t)             # drop issue number
+        t = re.sub(r'\b(issue|iss)\s*\d+\b', '', t)         # alternate issue labels
+        t = re.sub(r'[\-–—_:]+', ' ', t)
+        t = re.sub(r'\s+', ' ', t).strip()
+        return t
+
+    def _start_cover_loading_for_tab(self, idx: int):
+        cat = self._cat_for_tab_index(idx)
+        if not self._render_groups or cat not in self._render_groups:
+            return
+
+        entries = self._render_groups.get(cat, [])
+        if not entries:
+            return
+
+        if self._cover_thread and self._cover_thread.isRunning():
+            # If user switches tabs mid-load, restart fetching for the new category.
+            self._cover_thread.stop()
+            self._cover_thread.quit()
+            self._cover_thread.wait(2000)
+
+        # Load only covers we don't already have cached.
+        to_fetch = [
+            e for e in entries
+            if e.get("url")
+            and not e.get("_no_cover")
+            and e.get("url") not in self._cover_cache
+        ]
+        # Watched can be large; fetch only newest visible slice to prevent hangs.
+        if cat == "watched" and len(to_fetch) > 30:
+            to_fetch = to_fetch[:30]
+        if not to_fetch:
+            return
+
+        self._cover_thread = GCCoverThread(to_fetch)
+        self._cover_thread.cover_ready.connect(self._on_cover)
+        self._cover_thread.start()
+
+        self._cover_tab_inflight = cat
+
+    def _update_publisher_tab_badges(self, groups):
+        # Put counts into the labels (e.g. "DC Comics (12)")
+        dc_n = sum(1 for e in groups.get("dc", []) if not self._is_collection(e.get("title", "")))
+        mv_n = sum(1 for e in groups.get("marvel", []) if not self._is_collection(e.get("title", "")))
+        oth_n = sum(1 for e in groups.get("other", []) if not self._is_collection(e.get("title", "")))
+        col_n = sum(
+            1 for e in (groups.get("dc", []) + groups.get("marvel", []) + groups.get("other", []))
+            if self._is_collection(e.get("title", ""))
+        )
+
+        self.pub_tabs.setTabText(0, f"DC Comics ({dc_n})")
+        self.pub_tabs.setTabText(1, f"Marvel ({mv_n})")
+        self.pub_tabs.setTabText(2, f"Others ({oth_n})")
+        self.pub_tabs.setTabText(3, f"Collections ({col_n})")
+
+        # Watched tab: same count as rows under the current Watched filter.
+        watched_n = len(self._watched_entries_filtered(groups))
+        self.pub_tabs.setTabText(4, f"Watched ({watched_n})")
+
+    def _update_watched_badge(self):
+        groups = self._active_groups or self._last_results or {}
+        if groups:
+            # This recomputes all three publisher counts too.
+            self._update_publisher_tab_badges(groups)
 
     @staticmethod
     def _this_wednesday():
@@ -1865,6 +2182,19 @@ class NewReleasesTab(QWidget):
         except Exception as _e:
             log.warning("Could not save followed: %s", _e)
 
+    def _merge_follow_entry(self, url: str, title: str, post_date: str = ""):
+        """Store title + GetComics post date so Watched still shows them off-week."""
+        if not url:
+            return
+        old = self._followed.get(url)
+        if isinstance(old, dict):
+            prev = dict(old)
+        else:
+            prev = {"title": str(old) if old else "", "date": ""}
+        new_title = (title or "").strip() or (prev.get("title") or "").strip()
+        new_date = (post_date or "").strip() or (prev.get("date") or "").strip()
+        self._followed[url] = {"title": new_title, "date": new_date}
+
     def _on_follow_collections_toggled(self, checked):
         self._follow_collections = checked
         APP_SETTINGS["follow_collections"] = bool(checked)
@@ -1873,18 +2203,34 @@ class NewReleasesTab(QWidget):
                 json.dump(APP_SETTINGS, f)
         except Exception:
             pass
-        # Auto-follow / unfollow all collection entries currently visible
-        if self._last_results:
-            for entries in self._last_results.values():
-                for entry in entries:
-                    if self._is_collection(entry.get("title", "")):
+        if checked:
+            if self._last_results:
+                _n = self._norm_gc_url
+                for entries in self._last_results.values():
+                    for entry in entries:
+                        if not self._is_collection(entry.get("title", "")):
+                            continue
                         u = entry.get("url", "")
-                        if checked:
-                            self._followed[u] = {"title": entry.get("title", "")}
-                        else:
-                            self._followed.pop(u, None)
+                        if u and u not in self._followed and _n(u) not in self._cleared_watch_urls:
+                            self._merge_follow_entry(
+                                u, entry.get("title", ""), entry.get("date", ""))
+                            self._auto_followed_urls.add(u)
+                self._save_followed()
+                self._render(self._last_results)
+        else:
+            # When turning off: unfollow currently followed collection entries,
+            # but keep regular issue follows.
+            to_remove = []
+            for u, meta in self._followed.items():
+                t = (meta or {}).get("title", "")
+                if t and self._is_collection(t):
+                    to_remove.append(u)
+            for u in to_remove:
+                self._followed.pop(u, None)
+                self._auto_followed_urls.discard(u)
             self._save_followed()
-            self._render(self._last_results)
+            if self._last_results:
+                self._render(self._last_results)
 
     def _save_downloaded(self):
         try:
@@ -1893,59 +2239,166 @@ class NewReleasesTab(QWidget):
         except Exception as _e:
             log.warning("Could not save downloaded list: %s", _e)
 
-    def mark_downloaded(self, url: str):
-        """Called by ComicBrowser when a download completes for a GC article URL."""
-        self._downloaded.add(url)
-        self._save_downloaded()
-        for lbl in self.findChildren(QLabel):
-            if lbl.property("title_label_for") == url:
-                text = lbl.text()
-                if not text.startswith("✅ "):
-                    lbl.setText("✅ " + text)
+    def _save_json_set(self, filename: str, s: set):
+        try:
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(sorted(s), f, indent=2)
+        except Exception as _e:
+            log.warning("Could not save %s: %s", filename, _e)
 
-        def hideEvent(self, event):
-        """Safely stop threads when tab is hidden (prevents crash on minimize)"""
-        threads_to_stop = [
-            getattr(self, '_fetch_thread', None),
-            getattr(self, '_cover_thread', None),
-            getattr(self, '_check_thread', None)
-        ]
-        for t in threads_to_stop:
+    def _title_html(self, url: str, base_title: str) -> str:
+        """Return HTML for title label with green checks (shows in all sections: DC, Marvel, Others, Collections, Watched)."""
+        t = html.escape(base_title or "")
+        if self._is_url_completed(url):
+            return "<span style='color:#50fa7b;font-weight:bold;'>✓</span> " + t
+        return t
+
+    def _refresh_title_check(self, url: str):
+        for lbl in self.findChildren(QLabel):
+            if lbl.property("title_label_for") != url:
+                continue
+            base_title = lbl.property("title_base") or ""
+            lbl.setTextFormat(Qt.TextFormat.RichText)
+            lbl.setText(self._title_html(url, base_title))
+
+    def _copy_page_link(self, url: str):
+        """Copy GetComics/redirect article URL so you can paste into jdownloader."""
+        u = (url or "").strip()
+        if not u:
+            return
+        QApplication.clipboard().setText(u)
+        self._copied_page_links.add(self._norm_gc_url(u))
+        self._save_json_set(self._copied_file, self._copied_page_links)
+        self._refresh_title_check(url)
+
+    def _show_copy_link_menu(self, pos, url: str):
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; }
+            QMenu::item { padding: 5px 20px; }
+            QMenu::item:selected { background-color: #44475a; }
+        """)
+        copy_action = menu.addAction("Copy page link")
+        btn = self.sender()
+        if btn is not None and hasattr(btn, "mapToGlobal"):
+            gpos = btn.mapToGlobal(pos)
+        else:
+            gpos = self.mapToGlobal(pos)
+        action = menu.exec(gpos)
+        if action == copy_action:
+            self._copy_page_link(url)
+
+    def _show_cover_context_menu(self, pos, article_url: str):
+        if not (article_url or "").strip():
+            return
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; }
+            QMenu::item { padding: 5px 20px; }
+            QMenu::item:selected { background-color: #44475a; }
+        """)
+        refresh_act = menu.addAction("Refresh cover")
+        btn = self.sender()
+        if btn is not None and hasattr(btn, "mapToGlobal"):
+            gpos = btn.mapToGlobal(pos)
+        else:
+            gpos = self.mapToGlobal(pos)
+        act = menu.exec(gpos)
+        if act == refresh_act:
+            self._refresh_gc_cover(article_url.strip())
+
+    def _refresh_gc_cover(self, article_url: str):
+        """Re-fetch og:image for one card (longer timeout, clears cache first)."""
+        u = (article_url or "").strip()
+        if not u:
+            return
+        self._cover_cache.pop(u, None)
+        gc_new_releases_uncache_thumb(u)
+        for lbl in self.findChildren(QLabel):
+            if lbl.property("gc_url") == u:
+                lbl.clear()
+                lbl.setText("Refreshing…")
+        thr = GCCoverThread(
+            [{"url": u, "title": "", "date": ""}],
+            request_timeout=15,
+            delay_between=0,
+        )
+        thr.cover_ready.connect(self._on_refreshed_single_cover)
+        thr.finished.connect(thr.deleteLater)
+
+        def _pop():
             try:
-                if t is not None and hasattr(t, 'isRunning'):
-                    if t.isRunning():
-                        t.quit()
-                        if hasattr(t, 'wait'):
-                            t.wait(timeout=500)
-            except (RuntimeError, AttributeError) as e:
-                log.warning("Error stopping thread during hideEvent: %s", e)
+                self._single_cover_threads.remove(thr)
+            except ValueError:
+                pass
+        thr.finished.connect(_pop)
+        self._single_cover_threads.append(thr)
+        thr.start()
+
+    def _on_refreshed_single_cover(self, article_url: str, data: bytes):
+        self._cover_cache[article_url] = data
+        self._on_cover(article_url, data)
+        if not data:
+            for lbl in self.findChildren(QLabel):
+                if lbl.property("gc_url") == article_url:
+                    lbl.setText("No cover")
+
+    def mark_downloaded(self, url: str, via_hoster: bool = False):
+        """Called by ComicBrowser when a download completes for a GC article URL."""
+        u = (url or "").strip()
+        if not u:
+            return
+        un = self._norm_gc_url(u)
+        self._downloaded.add(un)
+        self._save_downloaded()
+        if via_hoster:
+            self._hoster_downloaded.add(un)
+            self._save_json_set(self._hoster_file, self._hoster_downloaded)
+        self._refresh_title_check(u)
+        self._update_watched_badge()
+
+    def hideEvent(self, event):
+        for t in [self._fetch_thread, self._cover_thread, self._check_thread]:
+            if t and t.isRunning():
+                if t == self._cover_thread and hasattr(t, "stop"):
+                    t.stop()
+                t.quit()
+                t.wait(2000)
         super().hideEvent(event)
 
-        def _clear_all(self):
-        """Safely clear all layouts and stop threads"""
-        try:
-            if hasattr(self, '_cover_thread') and self._cover_thread:
-                if hasattr(self._cover_thread, 'isRunning') and self._cover_thread.isRunning():
-                    if hasattr(self._cover_thread, 'stop'):
-                        self._cover_thread.stop()
-                    self._cover_thread.quit()
-                    if hasattr(self._cover_thread, 'wait'):
-                        self._cover_thread.wait(timeout=500)
-        except (RuntimeError, AttributeError) as e:
-            log.warning("Error stopping cover thread: %s", e)
-        
-        # Clear all layouts safely
-        for lay in (self.dc_layout, self.mv_layout, self.oth_layout, self.wt_layout):
-            try:
-                while lay.count() > 1:
-                    item = lay.takeAt(0)
-                    if item and item.widget():
-                        try:
-                            item.widget().deleteLater()
-                        except RuntimeError:
-                            pass
-            except (RuntimeError, AttributeError):
-                pass
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Covers were cached while minimized; repaint labels now.
+        self._refresh_covers_from_cache()
+        # Refresh badge counts when tab becomes visible (fixes counts not showing until layout triggers).
+        self._update_watched_badge()
+
+    def _refresh_covers_from_cache(self):
+        for lbl in self.findChildren(QLabel):
+            u = lbl.property("gc_url")
+            if not u:
+                continue
+            data = self._cover_cache.get(u)
+            if not data:
+                continue
+            pix = QPixmap()
+            if pix.loadFromData(data) and not pix.isNull():
+                lbl.setPixmap(pix.scaled(
+                    130, 195,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation))
+                lbl.setText("")
+
+    def _clear_all(self):
+        if self._cover_thread and self._cover_thread.isRunning():
+            self._cover_thread.stop()
+            self._cover_thread.quit()
+            self._cover_thread.wait(2000)
+        for lay in (self.dc_layout, self.mv_layout, self.oth_layout, self.col_layout, self.wt_layout):
+            while lay.count() > 1:
+                item = lay.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
 
     def _load_week(self):
         self._clear_all()
@@ -1971,18 +2424,55 @@ class NewReleasesTab(QWidget):
             self.status_lbl.setText("No releases found for this week on GetComics.")
             return
         self._last_results = groups
+        self._active_groups = groups
+        _n = self._norm_gc_url
+
+        # Carry follows forward to newly released issues/collections that match
+        # previously followed series keys.
+        followed_keys = set()
+        for meta in self._followed.values():
+            if isinstance(meta, dict):
+                mk = self._watch_key(meta.get("title", ""))
+                if mk:
+                    followed_keys.add(mk)
+        if followed_keys:
+            for entries in groups.values():
+                for entry in entries:
+                    u = entry.get("url", "")
+                    if not u or u in self._followed or _n(u) in self._cleared_watch_urls:
+                        continue
+                    ek = self._watch_key(entry.get("title", ""))
+                    if ek and ek in followed_keys:
+                        self._merge_follow_entry(
+                            u, entry.get("title", ""), entry.get("date", ""))
+            self._save_followed()
         self.count_lbl.setText(
-            f"{total} releases  •  DC {len(groups['dc'])}  "
-            f"Marvel {len(groups['marvel'])}  Others {len(groups['other'])}")
+            f"({total}) releases  •  DC ({len(groups['dc'])})  "
+            f"Marvel ({len(groups['marvel'])})  Others ({len(groups['other'])})")
         self.status_lbl.setText("")
+        # If bulk-follow is enabled, add all *collection-type* releases that
+        # are visible right now (but keep manual follows intact).
+        if self._follow_collections:
+            for entries in groups.values():
+                for entry in entries:
+                    if not self._is_collection(entry.get("title", "")):
+                        continue
+                    u = entry.get("url", "")
+                    if u and u not in self._followed and _n(u) not in self._cleared_watch_urls:
+                        self._merge_follow_entry(
+                            u, entry.get("title", ""), entry.get("date", ""))
+                        self._auto_followed_urls.add(u)
+            self._save_followed()
+
         self._render(groups)
-        all_entries = groups["dc"] + groups["marvel"] + groups["other"]
-        self._cover_thread = GCCoverThread(all_entries)
-        self._cover_thread.cover_ready.connect(self._on_cover)
-        self._cover_thread.start()
+        # Only fetch covers for the active tab so switching tabs "interrupts" work.
+        self._start_cover_loading_for_tab(self.pub_tabs.currentIndex())
 
     def _on_cover(self, article_url, data):
         self._cover_cache[article_url] = data
+        # If app/tab is hidden or minimized, avoid expensive widget scanning.
+        if not self.isVisible():
+            return
         for lbl in self.findChildren(QLabel):
             if lbl.property("gc_url") == article_url and data:
                 pix = QPixmap()
@@ -1995,64 +2485,77 @@ class NewReleasesTab(QWidget):
 
     def _render(self, groups):
         self._clear_all()
-        colours = {"dc": "#0476D0", "marvel": "#ff0000", "other": "#44475a", "watched": "#bd93f9"}
-        layouts = {"dc": self.dc_layout, "marvel": self.mv_layout, "other": self.oth_layout, "watched": self.wt_layout}
+        colours = {
+            "dc": "#0476D0",
+            "marvel": "#ff0000",
+            "other": "#44475a",
+            "collections": "#ffb86c",
+            "watched": "#bd93f9",
+        }
+        layouts = {
+            "dc": self.dc_layout,
+            "marvel": self.mv_layout,
+            "other": self.oth_layout,
+            "collections": self.col_layout,
+            "watched": self.wt_layout,
+        }
+
+        # Split collection posts out of normal publisher lists so those tabs
+        # show issue-like posts only.
+        dc_issues = [e for e in groups.get("dc", []) if not self._is_collection(e.get("title", ""))]
+        mv_issues = [e for e in groups.get("marvel", []) if not self._is_collection(e.get("title", ""))]
+        oth_issues = [e for e in groups.get("other", []) if not self._is_collection(e.get("title", ""))]
+        col_entries = [
+            e for e in (groups.get("dc", []) + groups.get("marvel", []) + groups.get("other", []))
+            if self._is_collection(e.get("title", ""))
+        ]
 
         current_by_url = {}
-        for cat in ("dc", "marvel", "other"):
-            for e in groups.get(cat, []):
+        for entries in (dc_issues, mv_issues, oth_issues, col_entries):
+            for e in entries:
                 u = e.get("url", "")
                 if u:
                     current_by_url[u] = e
 
-        watched_entries = []
-        for u, meta in self._followed.items():
-            if not isinstance(u, str) or not u.startswith("http"):
+        # Build watched from current-week followed entries + older followed links.
+        week_order = dc_issues + mv_issues + oth_issues + col_entries
+        week_urls = {e.get("url", "") for e in week_order if e.get("url", "")}
+
+        # Refresh stored title/date when a followed URL appears in this week's feed.
+        _follow_dirty = False
+        for e in week_order:
+            u = e.get("url", "")
+            if not u or u not in self._followed:
                 continue
-            if u in current_by_url:
-                watched_entries.append(current_by_url[u])
-            else:
-                watched_entries.append({
-                    "title": (meta or {}).get("title", u),
-                    "url": u,
-                    "date": "",
-                    "_no_cover": True,
-                })
+            old = self._followed[u]
+            if not isinstance(old, dict):
+                old = {"title": str(old), "date": ""}
+            newd = dict(old)
+            if e.get("title"):
+                newd["title"] = e["title"]
+            if e.get("date"):
+                newd["date"] = e["date"]
+            if newd != old:
+                self._followed[u] = newd
+                _follow_dirty = True
+        if _follow_dirty:
+            self._save_followed()
+
+        watched_entries = self._watched_entries_filtered(groups)
 
         render_groups = {
-            "dc": groups.get("dc", []),
-            "marvel": groups.get("marvel", []),
-            "other": groups.get("other", []),
+            "dc": dc_issues,
+            "marvel": mv_issues,
+            "other": oth_issues,
+            "collections": col_entries,
             "watched": watched_entries,
         }
+        # Used by the cover loader so we can priority-load the active tab.
+        self._render_groups = render_groups
 
         for cat, entries in render_groups.items():
             lay = layouts[cat]
             border = colours[cat]
-            def parse_date(date_str):
-    """Parse date string like 'Jan 15, 2025' or 'Jan 15' to comparable tuple"""
-    try:
-        # Handle various date formats
-        if not date_str or date_str.strip() == "":
-            return (9999, 12, 31)  # Put empty dates at the end
-        
-        # Try to parse the date
-        date_obj = datetime.datetime.strptime(date_str.strip(), "%b %d, %Y")
-        return (date_obj.year, date_obj.month, date_obj.day)
-    except (ValueError, AttributeError):
-        try:
-            # Try without year
-            date_obj = datetime.datetime.strptime(date_str.strip(), "%b %d")
-            today = datetime.date.today()
-            return (today.year, date_obj.month, date_obj.day)
-        except (ValueError, AttributeError):
-            return (9999, 12, 31)  # Invalid dates go to end
-
-entries = sorted(entries, key=lambda e: (
-    0 if e.get("url", "") in self._followed else 1,  # Followed first
-    parse_date(e.get("date", "")),                     # Then by date (newest first)
-    e.get("title", "").lower()                         # Then alphabetical
-))
             COLS = 3
             for row_idx in range(0, len(entries), COLS):
                 group = entries[row_idx:row_idx + COLS]
@@ -2068,12 +2571,26 @@ entries = sorted(entries, key=lambda e: (
                     row_l.addStretch(1)
                 lay.insertWidget(lay.count() - 1, row_w)
 
+        QTimer.singleShot(0, lambda g=groups: self._update_publisher_tab_badges(g))
+
     def _is_collection(self, title: str) -> bool:
         t = title.lower()
+        # Explicit collection imprint
+        if "dc finest" in t:
+            return True
+        # If the title clearly references a single issue number, prefer issue classification.
+        # This avoids false positives like:
+        # - Batman – Superman – World's Finest #49
+        # - The Walking Dead Deluxe #133
+        if re.search(r'#\s*\d+(\.\d+)?\b', t):
+            return False
         return any(kw in t for kw in (
-            "omnibus", "compendium", "absolute", "tpb", "trade paperback",
-            "collected", "collection", "vol.", "volume", "book ", "finest",
-            "deluxe", "treasury", "epic collection", "masterworks",
+            # NOTE: Intentionally exclude "absolute". "Absolute" is a DC/brand
+            # label for some issues/series and should not be treated as a
+            # collected-volume type by the bulk follow toggle.
+            "omnibus", "compendium", "tpb", "trade paperback",
+            "collected", "collection", "vol.", "volume", "book ",
+            "treasury", "epic collection", "masterworks",
         ))
 
     def _make_card(self, entry, border_colour):
@@ -2103,10 +2620,25 @@ entries = sorted(entries, key=lambda e: (
         cover_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         cover_lbl.setStyleSheet(
             "background:#21222c; border-radius:3px; color:#6272a4; font-size:10px;")
-        cover_lbl.setText("No cover" if entry.get("_no_cover") else "Loading…")
+        cover_lbl.setText("Loading…")
         cover_lbl.setProperty("gc_url", url)
+        cover_lbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        cover_lbl.customContextMenuRequested.connect(
+            lambda pos, u=url: self._show_cover_context_menu(pos, u)
+        )
         frame_l.addWidget(cover_lbl)
         cl.addWidget(cover_frame, alignment=Qt.AlignmentFlag.AlignHCenter)
+        # Hot path: show disk thumbnail immediately (same cache as GCCoverThread).
+        if url and url not in self._cover_cache:
+            tp = gc_new_releases_thumb_path(url)
+            if os.path.isfile(tp):
+                try:
+                    with open(tp, "rb") as tf:
+                        disk_b = tf.read()
+                    if disk_b:
+                        self._cover_cache[url] = disk_b
+                except OSError:
+                    pass
         if url in self._cover_cache and self._cover_cache[url]:
             pix = QPixmap()
             if pix.loadFromData(self._cover_cache[url]) and not pix.isNull():
@@ -2116,28 +2648,43 @@ entries = sorted(entries, key=lambda e: (
                     Qt.TransformationMode.SmoothTransformation))
                 cover_lbl.setText("")
         cl.addSpacing(12)
-        title_text = ("✅ " if is_downloaded else "") + title
-        tl = QLabel(title_text)
+        tl = QLabel()
         tl.setStyleSheet(
             "color:#f8f8f2; font-weight:bold; font-size:11px; "
             "background:transparent;")
+        tl.setTextFormat(Qt.TextFormat.RichText)
+        tl.setText(self._title_html(url, title))
         tl.setWordWrap(True)
         tl.setMaximumWidth(COVER_W + 20)
         cl.addWidget(tl)
         tl.setProperty("title_label_for", url)
+        tl.setProperty("title_base", title)
         if date:
             dl = QLabel(date)
             dl.setStyleSheet("color:#6272a4; font-size:9px; background:transparent;")
             cl.addWidget(dl)
+        elif entry.get("_outside_week"):
+            dl = QLabel("Not in selected week")
+            dl.setStyleSheet(
+                "color:#6272a4; font-size:9px; background:transparent; font-style:italic;")
+            cl.addWidget(dl)
         cl.addStretch()
         follow_cb = QCheckBox("Follow")
-        follow_cb.setChecked(is_followed or (is_col and self._follow_collections))
+        # Only show "followed" if it's actually in the watched list.
+        # Bulk-follow works by populating _followed, not by overriding UI state.
+        follow_cb.setChecked(is_followed)
         follow_cb.setStyleSheet("color:#ffb86c; font-size:9px; background:transparent;")
         def _toggle(checked, u=url, t=title):
             if checked:
-                self._followed[u] = {"title": t}
+                self._merge_follow_entry(u, t, date)
+                # If user manually re-followed after a bulk auto-unfollow, it
+                # should not be treated as "auto-followed".
+                self._auto_followed_urls.discard(u)
+                self._cleared_watch_urls.discard(self._norm_gc_url(u))
+                self._save_cleared_watch_urls()
             else:
                 self._followed.pop(u, None)
+                self._auto_followed_urls.discard(u)
             self._save_followed()
             if self._last_results:
                 self._render(self._last_results)
@@ -2148,6 +2695,11 @@ entries = sorted(entries, key=lambda e: (
             "background:#50fa7b; color:#282a36; font-weight:bold; "
             "padding:4px 0; border-radius:4px; font-size:10px;")
         dl_btn.clicked.connect(lambda _, u=url: self.open_url.emit(u))
+        # Right-click "Copy page link"
+        dl_btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        dl_btn.customContextMenuRequested.connect(
+            lambda pos, u=url: self._show_copy_link_menu(pos, u)
+        )
         cl.addWidget(dl_btn)
         return card
 
@@ -2179,22 +2731,6 @@ class SettingsTab(QWidget):
         gem_layout.addWidget(self.gem_input)
         self.layout.addLayout(gem_layout)
 
-        self.layout.addSpacing(10)
-        self.layout.addWidget(QLabel("🌐 Metron (New Releases) — free account at metron.cloud"))
-
-        met_user_layout = QHBoxLayout()
-        met_user_layout.addWidget(QLabel("Metron Username:"))
-        self.metron_user_input = QLineEdit(APP_SETTINGS.get("metron_user", ""))
-        met_user_layout.addWidget(self.metron_user_input)
-        self.layout.addLayout(met_user_layout)
-
-        met_pass_layout = QHBoxLayout()
-        met_pass_layout.addWidget(QLabel("Metron Password:"))
-        self.metron_pass_input = QLineEdit(APP_SETTINGS.get("metron_pass", ""))
-        self.metron_pass_input.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
-        met_pass_layout.addWidget(self.metron_pass_input)
-        self.layout.addLayout(met_pass_layout)
-        
         self.layout.addSpacing(20)
         
         # --- External Reader ---
@@ -2259,8 +2795,6 @@ class SettingsTab(QWidget):
         APP_SETTINGS["reader_path"] = self.reader_input.text().strip()
         APP_SETTINGS["chat_voice"]  = self.voice_combo.currentText()
         APP_SETTINGS["chat_speed"]  = self.speed_slider.value()
-        APP_SETTINGS["metron_user"] = self.metron_user_input.text().strip()
-        APP_SETTINGS["metron_pass"] = self.metron_pass_input.text().strip()
         
         config.COMIC_VINE_KEY = APP_SETTINGS["cv_key"]
         config.GEMINI_KEY = APP_SETTINGS["gemini_key"]
@@ -2294,7 +2828,9 @@ class BatchAutoReviewDialog(QDialog):
         self.index      = 0
         self.img_thread = None
         self.search_thread = None
+        self.issue_thread = None
         self._pending_result = None
+        self._load_id = 0  # Increment on each load to ignore stale async callbacks
 
         self.setWindowTitle("🏷️ Review Auto-Tagged Results")
         self.setMinimumSize(1000, 660)
@@ -2430,6 +2966,27 @@ class BatchAutoReviewDialog(QDialog):
 
         self._load_match()
 
+    def _stop_img_thread(self):
+        if self.img_thread and self.img_thread.isRunning():
+            self.img_thread.quit()
+            self.img_thread.wait(3000)
+
+    def _stop_issue_thread(self):
+        if self.issue_thread and self.issue_thread.isRunning():
+            self.issue_thread.quit()
+            self.issue_thread.wait(3000)
+
+    def _stop_search_thread(self):
+        if self.search_thread and self.search_thread.isRunning():
+            self.search_thread.quit()
+            self.search_thread.wait(3000)
+
+    def closeEvent(self, event):
+        self._stop_img_thread()
+        self._stop_issue_thread()
+        self._stop_search_thread()
+        super().closeEvent(event)
+
     def _current(self):
         return self.matches[self.index]
 
@@ -2487,8 +3044,7 @@ class BatchAutoReviewDialog(QDialog):
                 except Exception:
                     pass
             if url:
-                if self.img_thread and self.img_thread.isRunning():
-                    self.img_thread.quit()
+                self._stop_img_thread()
                 self.img_thread = ImageDownloadThread(url)
                 idx = self.index
                 def _got(data, i=idx, match=m):
@@ -2549,7 +3105,108 @@ class BatchAutoReviewDialog(QDialog):
 
     def _do_search(self):
         query = self.search_input.text().strip()
-        if not query: return
+        if not query:
+            return
+        self.results_list.clear()
+        self.results_list.addItem("🔍 Searching Comic Vine…")
+        self.overwrite_btn.setEnabled(False)
+        self._pending_result = None
+        if self.search_thread and self.search_thread.isRunning():
+            self.search_thread.quit()
+            self.search_thread.wait(1000)
+        self.search_thread = ComicVineIssueSearchThread(query)
+        self.search_thread.results_ready.connect(self._on_search_results)
+        self.search_thread.start()
+
+    def _on_search_results(self, results):
+        self.results_list.clear()
+        if not results:
+            self.results_list.addItem("❌ No issues found.")
+            return
+        for r in results:
+            vol = r.get("volume") or {}
+            vol_name = vol.get("name", "Unknown")
+            num = r.get("issue_number", "?")
+            date = r.get("cover_date", "")[:10] if r.get("cover_date") else ""
+            label = f"{vol_name} #{num}" + (f"  •  {date}" if date else "")
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, r)
+            self.results_list.addItem(item)
+
+    def _on_result_selected(self, item):
+        if not item:
+            return
+        issue_data = item.data(Qt.ItemDataRole.UserRole)
+        if not issue_data:
+            return
+        api_url = issue_data.get("api_detail_url")
+        if api_url:
+            self.cv_cover.setText("Loading…")
+            self.overwrite_btn.setEnabled(False)
+            self._pending_result = None
+            if self.issue_thread and self.issue_thread.isRunning():
+                self.issue_thread.quit()
+                self.issue_thread.wait(1000)
+            self.issue_thread = ComicVineIssueThread(direct_api_url=api_url)
+            self.issue_thread.issue_ready.connect(self._on_full_issue_loaded)
+            self.issue_thread.start()
+        else:
+            self._pending_result = issue_data
+            self.overwrite_btn.setEnabled(True)
+            self._show_result_cover(issue_data)
+
+    def _on_full_issue_loaded(self, full_data):
+        if not full_data:
+            self.cv_cover.setText("Load failed")
+            return
+        self._pending_result = full_data
+        self.overwrite_btn.setEnabled(True)
+        self._show_result_cover(full_data)
+
+    def _show_result_cover(self, issue_data):
+        url = (issue_data.get("image") or {}).get("medium_url") or (issue_data.get("image") or {}).get("small_url") or ""
+        vol = issue_data.get("volume") or {}
+        self.cv_name.setText(f"{vol.get('name', '')} #{issue_data.get('issue_number', '')}")
+        if url:
+            if self.img_thread and self.img_thread.isRunning():
+                self.img_thread.quit()
+                self.img_thread.wait(1000)
+            self.img_thread = ImageDownloadThread(url)
+            self.img_thread.image_ready.connect(self._on_cover_loaded)
+            self.img_thread.start()
+        else:
+            self.cv_cover.setText("No cover")
+
+    def _on_cover_loaded(self, data):
+        if not data:
+            self.cv_cover.setText("Load failed")
+            return
+        pix = QPixmap()
+        if pix.loadFromData(data):
+            self.cv_cover.setPixmap(
+                pix.scaled(220, 330, Qt.AspectRatioMode.KeepAspectRatio,
+                           Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.cv_cover.setText("No cover")
+
+    def _overwrite(self):
+        if not self._pending_result:
+            return
+        m = self._current()
+        path = m.get("path") or m.get("file_path")
+        if not path or not os.path.isfile(path):
+            QMessageBox.warning(self, "Overwrite Failed", "File not found.")
+            return
+        try:
+            xml_str = generate_comicinfo_xml(self._pending_result, path)
+            inject_metadata_into_cbz(path, xml_str)
+            m["issue_data"] = self._pending_result
+            m["overwritten"] = True
+            self._pending_result = None
+            self.overwrite_btn.setEnabled(False)
+            self._load_match()
+        except Exception as e:
+            QMessageBox.critical(self, "Overwrite Failed", str(e))
 
 
 # ==============================================================================
@@ -2732,6 +3389,7 @@ class BatchTaggerTab(QWidget):
             
     def update_log(self, current_index, message):
         self.progress_bar.setValue(current_index)
+        self.progress_bar.setFormat("%v of %m comics")
         self.log_display.append(message)
 
     def tagging_finished(self):
@@ -2769,7 +3427,7 @@ class BatchTaggerTab(QWidget):
 # GET COMICS TAB
 # ==============================================================================
 class GetComicsTab(QWidget):
-    download_completed = pyqtSignal(str)   # emits the article URL when download finishes
+    download_completed = pyqtSignal(str, bool)   # emits (article URL, via_hoster)
     def __init__(self):
         super().__init__()
         self.layout = QVBoxLayout(self)
@@ -2789,7 +3447,7 @@ class GetComicsTab(QWidget):
         self.reload_btn.clicked.connect(self.reload_page)
         
         self.url_bar = QLineEdit()
-        self.url_bar.setText("https://getcomics.info/") 
+        self.url_bar.setText("https://getcomics.org/") 
         self.url_bar.returnPressed.connect(self.load_url)
         
         self.go_btn = QPushButton("Go")
@@ -2849,6 +3507,7 @@ class GetComicsTab(QWidget):
         self._current_dl_url    = ""
         self._origin_article_url = ""
         self._last_getcomics_article_url = ""
+        self._current_dl_via_hoster = False
 
     def go_back(self): self.browser.back()
     def go_forward(self): self.browser.forward()
@@ -2906,6 +3565,23 @@ class GetComicsTab(QWidget):
                 or self.url_bar.text()
             )
 
+            # Detect whether the download came from a hoster we care about.
+            dl_url = ""
+            try:
+                dl_url = download.url().toString()
+            except Exception:
+                dl_url = ""
+            if not dl_url:
+                try:
+                    dl_url = download.downloadUrl().toString()
+                except Exception:
+                    dl_url = ""
+
+            low_dl = (dl_url or "").lower()
+            low_bar = (self.url_bar.text() or "").lower()
+            self._current_dl_via_hoster = any(x in low_dl for x in ("mega.nz", "rootz", "terabox")) or \
+                                            any(x in low_bar for x in ("mega.nz", "rootz", "terabox"))
+
             download.receivedBytesChanged.connect(self.update_dl_progress)
             download.stateChanged.connect(self.dl_state_changed)
 
@@ -2931,12 +3607,14 @@ class GetComicsTab(QWidget):
             self.dl_status_label.setText("✅ Download Complete!")
             self.dl_progress.setVisible(False)
             if self._current_dl_url:
-                self.download_completed.emit(self._current_dl_url)
+                self.download_completed.emit(self._current_dl_url, self._current_dl_via_hoster)
                 self._current_dl_url = ""
+                self._current_dl_via_hoster = False
         elif state in (QWebEngineDownloadRequest.DownloadState.DownloadCancelled,
                        QWebEngineDownloadRequest.DownloadState.DownloadInterrupted):
             self.dl_status_label.setText("❌ Download Failed/Cancelled.")
             self.dl_progress.setVisible(False)
+            self._current_dl_via_hoster = False
 
 
 # ==============================================================================
@@ -3763,11 +4441,11 @@ class ComicBrowser(QMainWindow):
         self.getcomics_tab = None
 
         # Add the two local tabs immediately (always visible on startup)
-        self.tabs.addTab(self.details_tab, "Local Details")
+        self.tabs.addTab(self.details_tab, "Comic Details")
         self.tabs.addTab(self.grid_tab, "Local Grid")
         # Add placeholder widgets for the deferred tabs
         for label in ("Comic Finder", "Comic Chat", "Batch Tagger",
-                      "Getcomic.info", "List Maker", "New Releases", "Settings"):
+                      "GetComics", "List Maker", "New Releases", "Settings"):
             placeholder = QWidget()
             self.tabs.addTab(placeholder, label)
 
@@ -3837,7 +4515,7 @@ class ComicBrowser(QMainWindow):
                     self.new_releases_tab.mark_downloaded)
             self.tabs.blockSignals(True)
             self.tabs.removeTab(index)
-            self.tabs.insertTab(index, self.getcomics_tab, 'Getcomic.info')
+            self.tabs.insertTab(index, self.getcomics_tab, 'GetComics')
             self.tabs.blockSignals(False)
             self.tabs.setCurrentIndex(index)
 
@@ -4459,7 +5137,7 @@ class ComicBrowser(QMainWindow):
             return
         # -----------------------------------------------------
 
-        # 3. If it's a CBZ/CBR, load the Local Details tab!
+        # 3. If it's a CBZ/CBR, load the Comic Details tab!
         self.tabs.setCurrentIndex(0) 
         if file_path.lower().endswith(('.cbz', '.cbr')):
             self.current_comic_path = file_path 
@@ -4523,7 +5201,7 @@ class ComicBrowser(QMainWindow):
                 self.tabs.setCurrentIndex(getcomics_idx)
                 
                 safe_query = urllib.parse.quote_plus(search_query)
-                search_url = f"https://getcomics.info/?s={safe_query}"
+                search_url = f"https://getcomics.org/?s={safe_query}"
                 
                 self._ensure_tab_built(self._TAB_GETCOMICS)
                 self.getcomics_tab.url_bar.setText(search_url)
@@ -6125,6 +6803,7 @@ class ComicBrowser(QMainWindow):
         """)
         
         open_action = menu.addAction("📂 Open in File Explorer")
+        tagger_action = menu.addAction("🏷️ Send to Batch Tagger")
         
         action = menu.exec(self.tree.viewport().mapToGlobal(position))
         
@@ -6134,6 +6813,11 @@ class ComicBrowser(QMainWindow):
                 os.startfile(folder)
             except Exception as e:
                 print(f"Could not open folder: {e}")
+        elif action == tagger_action:
+            folder = path if os.path.isdir(path) else os.path.dirname(path)
+            self._ensure_tab_built(self._TAB_TAGGER)
+            self.tagger_tab.receive_folder(folder)
+            self.tabs.setCurrentIndex(self._TAB_TAGGER)
 
     def apply_dark_theme(self):
         self.setStyleSheet("""

@@ -307,6 +307,9 @@ def parse_comic_filename_full(base_name: str) -> dict:
         series = clean[:m_vol.start()].strip().rstrip('-\u2013\u2014 \t')
         vol_num = m_vol.group(1)
         after = clean[m_vol.end():].strip()
+        if after and re.match(r'^\d+$', after):
+            return dict(series=series, vol_num=vol_num, issue=after,
+                        subtitle="", year=year, is_tpb=False)
         m_sub = re.match(r'^[-\u2013\u2014:]\s*(.+)', after)
         subtitle = m_sub.group(1).strip() if m_sub else ""
         if not subtitle:
