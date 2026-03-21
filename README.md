@@ -139,15 +139,23 @@ Build `.cbl` comic reading lists.
 ---
 
 <img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/23292bfe-ce7d-4d60-9a47-b6bd7ae648fd" />
-### New Releases Tab
-See what came out this week.
 
-- Fetches this week's new issues from Comic Vine using the `store_date` field (actual shelf date)
-- **2-column card grid** with 140×210px covers, title, issue name, and a Download button per card
-- **Publisher grouping** with coloured header badges — DC Comics (blue), Marvel (red), Image Comics (orange), Dark Horse, IDW, BOOM!, Dynamite, Valiant, and more; sorted DC → Marvel → everyone else by volume descending
-- **Week navigation** — `◀ Prev Week` and `Next Week ▶` step in 7-day increments; weeks are Wednesday-aligned (new comic day)
-- **Download button** on each card opens GetComics.info with a pre-filled search for that title
-- Refresh button to re-fetch
+### New Releases tab 
+-Lets you browse weekly comic releases from [GetComics](https://getcomics.org/), follow series you care about, and track what you’ve downloaded—all in one place.
+The tab pulls release data from the GetComics sitemap, groups entries by publisher, and shows them as cards with covers, release dates, and action buttons. You can navigate by week, follow individual releases or entire collection types, and keep a personal watch list.
+- Clicking **⬇ Download** on a release opens the **GetComics** tab and loads that article.
+- When a download finishes in the GetComics tab, the release is marked as downloaded and gets a green check in New Releases.
+- ### Per-release follow
+- Each card has a **Follow** checkbox. When checked, the release is added to your **Watched** list and saved across sessions.
+### Follow all Collections
+-The checkbox **📚 Follow all Collections** auto-follows all collection-type releases (omnibus, TPB, compendium, etc.). When enabled, new collection posts in the current week are added to Watched automatically. Turning it off removes only collection-type follows; single-issue follows stay.
+**Hint:** Right-click on the Download button to copy the page link (for JDownloader, etc.).
+## Watched Tab
+-The Watched tab shows everything you follow. You can filter it with **Watched: All / Issues only / Collections only.
+-Entries are sorted by date (newest first), with “outside week” items at the end.
+-If you follow a series (e.g. *Radiant Black*), future releases that match that series key (title normalized, without issue number or year) are automatically added to Watched when they appear in the feed.
+-A green check (✓) in front of a title means it’s marked as downlaoded.
+
 
 ---
 
