@@ -2071,29 +2071,26 @@ class NewReleasesTab(QWidget):
                 self._start_cover_loading_for_tab(self.pub_tabs.currentIndex())
 
     def _clear_downloaded_from_followed(self):
+        """Refresh Watched only. Do not unfollow — Follow stays checked; ✓ stays on publisher tabs."""
         if not self._followed:
+            self._nr_information("Clear Downloaded", "You are not following any releases.")
             return
         _n = self._norm_gc_url
-        to_remove = [
+        completed_followed = [
             u for u in self._followed.keys()
-            if _n(u) in self._downloaded
-            or _n(u) in self._copied_page_links
-            or _n(u) in self._hoster_downloaded
+            if isinstance(u, str) and u.startswith("http")
+            and (
+                _n(u) in self._downloaded
+                or _n(u) in self._copied_page_links
+                or _n(u) in self._hoster_downloaded
+            )
         ]
-        if not to_remove:
+        if not completed_followed:
             self._nr_information(
                 "Clear Downloaded",
-                "No completed items in Watched (download, copy link, or hoster).",
+                "No followed releases are marked as completed (download, copy link, or hoster).",
             )
             return
-        for u in to_remove:
-            self._followed.pop(u, None)
-            self._auto_followed_urls.discard(u)
-            self._cleared_watch_urls.add(_n(u))
-            # Keep _downloaded, _copied_page_links, _hoster_downloaded intact so check marks
-            # remain in DC/Marvel/Others sections (only remove from Watched list).
-        self._save_followed()
-        self._save_cleared_watch_urls()
         if self._last_results:
             self._render(self._last_results)
         self._update_watched_badge()
@@ -2376,6 +2373,8 @@ class NewReleasesTab(QWidget):
             self._save_json_set(self._hoster_file, self._hoster_downloaded)
         self._refresh_title_check(u)
         self._update_watched_badge()
+        if self._last_results:
+            self._render(self._last_results)
 
     def hideEvent(self, event):
         for t in [self._fetch_thread, self._cover_thread, self._check_thread]:
