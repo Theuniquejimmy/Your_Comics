@@ -138,7 +138,7 @@ Build `.cbl` comic reading lists.
 
 ---
 
-<img width="2560" height="1390" alt="image" src="https://github.com/user-attachments/assets/23292bfe-ce7d-4d60-9a47-b6bd7ae648fd" />
+<img width="1628" height="1103" alt="image" src="https://github.com/user-attachments/assets/5c3d8c0e-1354-4d7d-a0e2-b803054969b1" />
 
 ### New Releases tab 
 -Lets you browse weekly comic releases from [GetComics](https://getcomics.org/), follow series you care about, and track what you’ve downloaded—all in one place.
