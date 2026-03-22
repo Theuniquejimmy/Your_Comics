@@ -77,15 +77,32 @@ from widgets import (
     HoverSummaryList,
 )
 
-# Dracula-themed message boxes (default QMessageBox is light on many platforms).
-DRACULA_MSGBOX_QSS = """
-    QMessageBox { background-color: #282a36; color: #f8f8f2; }
-    QMessageBox QLabel { color: #f8f8f2; }
-    QPushButton {
-        background-color: #44475a; color: #f8f8f2;
+
+def _themed_information(parent, title: str, text: str):
+    """Show an information message box with the current theme."""
+    msg = QMessageBox(parent)
+    msg.setWindowTitle(title)
+    msg.setIcon(QMessageBox.Icon.Information)
+    msg.setText(text)
+    msg.setStyleSheet(_msgbox_stylesheet())
+    msg.exec()
+
+
+def _msgbox_stylesheet():
+    """Theme-aware message box stylesheet."""
+    t = APP_SETTINGS.get("theme", "dracula")
+    if t == "black":
+        bg, text, btn, btn_hover = "#121212", "#E0E0E0", "#444444", "#888888"
+    else:
+        bg, text, btn, btn_hover = "#282a36", "#f8f8f2", "#44475a", "#6272a4"
+    return f"""
+    QMessageBox {{ background-color: {bg}; color: {text}; }}
+    QMessageBox QLabel {{ color: {text}; }}
+    QPushButton {{
+        background-color: {btn}; color: {bg};
         padding: 5px 15px; border-radius: 3px; font-weight: bold;
-    }
-    QPushButton:hover { background-color: #6272a4; }
+    }}
+    QPushButton:hover {{ background-color: {btn_hover}; color: {bg}; }}
 """
 
 from PyQt6.QtWidgets import (
@@ -694,12 +711,7 @@ class ListMakerTab(QWidget):
         msg.setInformativeText(f"{description}\n\nTotal Issues/Books: {len(items)}\n\nDo you want to add this to your reading list?")
         msg.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         msg.setDefaultButton(QMessageBox.StandardButton.Yes)
-        msg.setStyleSheet("""
-            QMessageBox { background-color: #282a36; color: #f8f8f2; }
-            QLabel { color: #f8f8f2; }
-            QPushButton { background-color: #44475a; color: white; padding: 5px 15px; border-radius: 3px; font-weight: bold; }
-            QPushButton:hover { background-color: #6272a4; }
-        """)
+        msg.setStyleSheet(_msgbox_stylesheet())
 
         if msg.exec() == QMessageBox.StandardButton.Yes:
             self.status_label.setText(f"✅ AI added {len(items)} items!")
@@ -1980,7 +1992,7 @@ class NewReleasesTab(QWidget):
         msg.setWindowTitle(title)
         msg.setIcon(QMessageBox.Icon.Information)
         msg.setText(text)
-        msg.setStyleSheet(DRACULA_MSGBOX_QSS)
+        msg.setStyleSheet(_msgbox_stylesheet())
         msg.exec()
 
     def _watched_entries_filtered(self, groups):
@@ -2001,11 +2013,16 @@ class NewReleasesTab(QWidget):
         for e in week_order:
             u = e.get("url", "")
             if u and u in self._followed and _n(u) not in self._cleared_watch_urls:
+                # Hide grabbed items from Watched only; keep followed for next issue + ✓ in publisher tabs.
+                if self._is_url_completed(u):
+                    continue
                 watched_entries.append(e)
         for u, meta in self._followed.items():
             if not isinstance(u, str) or not u.startswith("http"):
                 continue
             if u in week_urls or _n(u) in self._cleared_watch_urls:
+                continue
+            if self._is_url_completed(u):
                 continue
             md = meta if isinstance(meta, dict) else {"title": str(meta), "date": ""}
             watched_entries.append({
@@ -2270,6 +2287,9 @@ class NewReleasesTab(QWidget):
         self._copied_page_links.add(self._norm_gc_url(u))
         self._save_json_set(self._copied_file, self._copied_page_links)
         self._refresh_title_check(url)
+        self._update_watched_badge()
+        if self._last_results:
+            self._render(self._last_results)
 
     def _show_copy_link_menu(self, pos, url: str):
         menu = QMenu(self)
@@ -2714,6 +2734,20 @@ class SettingsTab(QWidget):
         self.layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.layout.setContentsMargins(20, 20, 20, 20)
         
+        # --- Theme ---
+        self.layout.addWidget(QLabel("🎨 Theme"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(["Dracula", "Black"])
+        theme_val = APP_SETTINGS.get("theme", "dracula")
+        if theme_val == "soft_colors":
+            theme_val = "dracula"
+        display = theme_val.replace("_", " ").title()
+        idx = self.theme_combo.findText(display)
+        self.theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.layout.addWidget(self.theme_combo)
+        
+        self.layout.addSpacing(20)
+        
         # --- API Keys ---
         self.layout.addWidget(QLabel("🔑 API Keys (Requires App Restart to Apply)"))
         
@@ -2795,14 +2829,20 @@ class SettingsTab(QWidget):
         APP_SETTINGS["reader_path"] = self.reader_input.text().strip()
         APP_SETTINGS["chat_voice"]  = self.voice_combo.currentText()
         APP_SETTINGS["chat_speed"]  = self.speed_slider.value()
+        APP_SETTINGS["theme"]       = self.theme_combo.currentText().lower().replace(" ", "_")
         
         config.COMIC_VINE_KEY = APP_SETTINGS["cv_key"]
         config.GEMINI_KEY = APP_SETTINGS["gemini_key"]
         
         with open("settings.json", "w") as f:
             json.dump(APP_SETTINGS, f)
-            
-        QMessageBox.information(self, "Saved", "Settings saved successfully!\n(API key changes take effect on next restart or new search).")
+        
+        # Apply theme immediately
+        main_win = self.window()
+        if hasattr(main_win, "apply_dark_theme"):
+            main_win.apply_dark_theme()
+
+        _themed_information(self, "Saved", "Settings saved successfully!\n(API key changes take effect on next restart or new search).")
 
 
 # ==============================================================================
@@ -6820,122 +6860,150 @@ class ComicBrowser(QMainWindow):
             self.tabs.setCurrentIndex(self._TAB_TAGGER)
 
     def apply_dark_theme(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #282a36; }
-            QWidget { color: #f8f8f2; }
+        theme = APP_SETTINGS.get("theme", "dracula")
+        if theme == "black":
+            bg, bg_panel, text, text_secondary, border, accent = (
+                "#121212", "#1a1a1a", "#E0E0E0", "#B0B0B0", "#444444", "#888888"
+            )
+            accent_hover, success_bg, success_fg = "#888888", "#50fa7b", "#121212"
+        else:
+            bg, bg_panel, text, text_secondary, border, accent = (
+                "#282a36", "#21222c", "#f8f8f2", "#6272a4", "#44475a", "#6272a4"
+            )
+            accent_hover, success_bg, success_fg = "#50fa7b", "#50fa7b", "#282a36"
+        self.setStyleSheet(f"""
+            QMainWindow {{ background-color: {bg}; }}
+            QWidget {{ color: {text}; }}
             
-            /* --- GLOBAL MENU FIX: Fixes right-click in textboxes, chat, and browser! --- */
-            QMenu { 
-                background-color: #282a36; 
-                color: #f8f8f2; 
-                border: 1px solid #44475a; 
-            }
-            QMenu::item { 
-                padding: 5px 25px; 
-                background-color: transparent; 
-            }
-            QMenu::item:selected { 
-                background-color: #44475a; 
-            }
-            QMenu::separator { 
-                height: 1px; 
-                background: #44475a; 
-                margin: 5px 0px; 
-            }
-            /* ------------------------------------------------------------------------- */
+            QMenu {{
+                background-color: {bg};
+                color: {text};
+                border: 1px solid {border};
+            }}
+            QMenu::item {{
+                padding: 5px 25px;
+                background-color: transparent;
+            }}
+            QMenu::item:selected {{
+                background-color: {accent};
+            }}
+            QMenu::separator {{
+                height: 1px;
+                background: {border};
+                margin: 5px 0px;
+            }}
             
-            QTreeView, QListWidget, QTextBrowser { 
-                background-color: #21222c; 
-                border: 1px solid #44475a; 
-            }
-            QHeaderView::section {
-                background-color: #282a36;
-                color: #f8f8f2;
+            QTreeView, QListWidget, QTextBrowser {{
+                background-color: {bg_panel};
+                border: 1px solid {border};
+            }}
+            QHeaderView::section {{
+                background-color: {bg};
+                color: {text};
                 padding: 5px;
-                border: 1px solid #44475a;
-            }
+                border: 1px solid {border};
+            }}
             
-            QPushButton { background-color: #44475a; padding: 5px; border-radius: 3px; }
-            QPushButton:hover { background-color: #6272a4; }
-            QPushButton#read_btn { background-color: #50fa7b; color: #282a36; font-weight: bold; }
+            QPushButton {{ background-color: {border}; padding: 5px; border-radius: 3px; }}
+            QPushButton:hover {{ background-color: {accent}; }}
+            QPushButton#read_btn {{ background-color: {success_bg}; color: {success_fg}; font-weight: bold; }}
             
-            QLineEdit, QComboBox { 
-                background-color: #21222c; 
-                border: 1px solid #44475a; 
-                padding: 5px; 
-            }
-            QComboBox QAbstractItemView {
-                background-color: #282a36;
-                color: #f8f8f2;
-                selection-background-color: #44475a;
-            }
+            QLineEdit, QComboBox {{
+                background-color: {bg_panel};
+                border: 1px solid {border};
+                padding: 5px;
+            }}
+            QComboBox QAbstractItemView {{
+                background-color: {bg};
+                color: {text};
+                selection-background-color: {accent};
+            }}
             
-            QProgressBar {
-                background-color: #282a36; 
-                border: 1px solid #44475a;
+            QProgressBar {{
+                background-color: {bg};
+                border: 1px solid {border};
                 border-radius: 4px;
                 text-align: center;
-                color: #f8f8f2;
-            }
-            QProgressBar::chunk { background-color: #50fa7b; border-radius: 3px; }
+                color: {text};
+            }}
+            QProgressBar::chunk {{ background-color: {success_bg}; border-radius: 3px; }}
             
-            QTabWidget::pane { border: 1px solid #44475a; background: #282a36; }
-            QTabBar::tab { background: #21222c; padding: 8px 15px; border: 1px solid #44475a; }
-            QTabBar::tab:selected { background: #44475a; font-weight: bold; }
+            QTabWidget::pane {{ border: 1px solid {border}; background: {bg}; }}
+            QTabBar::tab {{ background: {bg_panel}; padding: 8px 15px; border: 1px solid {border}; }}
+            QTabBar::tab:selected {{ background: {border}; font-weight: bold; }}
             
-            QTabWidget#left_tabs > QTabBar::tab { padding: 8px 10px; width: 150px; }
+            QTabWidget#left_tabs > QTabBar::tab {{ padding: 8px 10px; width: 150px; }}
             
-            QSlider::groove:horizontal {
-                border: 1px solid #44475a;
+            QSlider::groove:horizontal {{
+                border: 1px solid {border};
                 height: 8px;
-                background: #282a36;
+                background: {bg};
                 margin: 2px 0;
                 border-radius: 4px;
-            }
-            QSlider::handle:horizontal {
-                background: #50fa7b;
-                border: 1px solid #44475a;
+            }}
+            QSlider::handle:horizontal {{
+                background: {success_bg};
+                border: 1px solid {border};
                 width: 14px;
                 margin: -4px 0;
                 border-radius: 7px;
-            }
+            }}
             
-            QScrollBar:vertical {
+            QScrollBar:vertical {{
                 border: none;
-                background: #282a36;
+                background: {bg};
                 width: 14px;
                 margin: 0px 0px 0px 0px;
-            }
-            QScrollBar::handle:vertical {
-                background: #6272a4;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {accent};
                 border-radius: 7px;
                 min-height: 20px;
-            }
-            QScrollBar::handle:vertical:hover { background: #50fa7b; }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+            }}
+            QScrollBar::handle:vertical:hover {{ background: {accent_hover}; }}
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
             
-            QScrollBar:horizontal {
+            QScrollBar:horizontal {{
                 border: none;
-                background: #282a36;
+                background: {bg};
                 height: 14px;
                 margin: 0px 0px 0px 0px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #6272a4;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {accent};
                 border-radius: 7px;
                 min-width: 20px;
-            }
-            QScrollBar::handle:horizontal:hover { background: #50fa7b; }
-            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; }
+            }}
+            QScrollBar::handle:horizontal:hover {{ background: {accent_hover}; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0px; }}
             
-            QSplitter::handle {
-                background-color: #44475a;
+            QSplitter::handle {{
+                background-color: {border};
                 margin: 2px;
                 border-radius: 2px;
-            }
-            QSplitter::handle:hover {
-                background-color: #8be9fd;
-            }
+            }}
+            QSplitter::handle:hover {{
+                background-color: {accent};
+            }}
+            
+            QMessageBox {{
+                background-color: {bg};
+                color: {text};
+            }}
+            QMessageBox QLabel {{
+                color: {text};
+            }}
+            QMessageBox QPushButton {{
+                background-color: {success_bg};
+                color: {success_fg};
+                padding: 5px 15px;
+                border-radius: 3px;
+                font-weight: bold;
+            }}
+            QMessageBox QPushButton:hover {{
+                background-color: {accent};
+                color: {bg};
+            }}
         """)
         self.read_btn.setObjectName("read_btn")
 
