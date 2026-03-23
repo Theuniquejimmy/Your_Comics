@@ -150,6 +150,8 @@ from PyQt6.QtCore import (
     Qt,
     QByteArray,
     QDir,
+    QEventLoop,
+    QFile,
     QMimeData,
     QSize,
     QSortFilterProxyModel,
@@ -869,6 +871,7 @@ class MetadataMatchDialog(QDialog):
 
         self.current_results = []
         self.selected_issue_data = None
+        self.xml_string = None
         self.search_thread = None
         self.img_thread = None
         self.issue_thread = None
@@ -924,6 +927,9 @@ class MetadataMatchDialog(QDialog):
         self.remote_cover_label.setText("Loading match...")
         self.save_btn.setEnabled(False)
 
+        # Store stub immediately so we always have fallback data
+        self.selected_issue_data = issue_stub
+
         if img_url:
             self.img_thread = ImageDownloadThread(img_url)
             self.img_thread.image_ready.connect(self.on_image_downloaded)
@@ -934,6 +940,9 @@ class MetadataMatchDialog(QDialog):
             self.issue_thread = ComicVineIssueThread(direct_api_url=api_url)
             self.issue_thread.issue_ready.connect(self.on_full_data_ready)
             self.issue_thread.start()
+        else:
+            # No detail URL available — enable button with stub data
+            self.save_btn.setEnabled(True)
 
     def on_image_downloaded(self, data):
         if data:
@@ -944,17 +953,21 @@ class MetadataMatchDialog(QDialog):
             self.remote_cover_label.setText("Image load failed.")
 
     def on_full_data_ready(self, data):
-        self.selected_issue_data = data
-        self.save_btn.setEnabled(True)
+        # Use full data if available; otherwise keep the stub already stored in on_result_clicked
+        if data and isinstance(data, dict):
+            self.selected_issue_data = data
+        # Always enable the button as long as we have *some* data (stub or full)
+        self.save_btn.setEnabled(bool(self.selected_issue_data))
 
     def inject_metadata(self):
-        if not self.selected_issue_data: return
+        if not self.selected_issue_data:
+            return
         try:
             self.xml_string = self.build_xml()
             self.accept()
         except Exception as e:
             log.warning("Error building XML: %s", e)
-            self.accept()
+            QMessageBox.critical(self, "Metadata Error", f"Could not build ComicInfo.xml:\n{e}")
 
     def generate_ai_info(self):
         query = self.search_input.text().strip()
@@ -2868,6 +2881,7 @@ class BatchAutoReviewDialog(QDialog):
         self.img_thread = None
         self.search_thread = None
         self.issue_thread = None
+        self.ai_thread = None
         self._pending_result = None
         self._load_id = 0  # Increment on each load to ignore stale async callbacks
 
@@ -2957,6 +2971,10 @@ class BatchAutoReviewDialog(QDialog):
         self.overwrite_btn.setEnabled(False)
         self.overwrite_btn.clicked.connect(self._overwrite)
         sb.addWidget(self.overwrite_btn)
+        self.overwrite_ai_btn = QPushButton("🤖 Overwrite with AI")
+        self.overwrite_ai_btn.setStyleSheet("background:#bd93f9; color:#282a36; font-size:13px;")
+        self.overwrite_ai_btn.clicked.connect(self._overwrite_with_ai)
+        sb.addWidget(self.overwrite_ai_btn)
         self.search_box.hide()
         centre.addWidget(self.search_box)
         centre.addStretch()
@@ -3171,6 +3189,10 @@ class BatchAutoReviewDialog(QDialog):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, r)
             self.results_list.addItem(item)
+        if self.results_list.count() > 0:
+            first = self.results_list.item(0)
+            self.results_list.setCurrentItem(first)
+            self._on_result_selected(first)
 
     def _on_result_selected(self, item):
         if not item:
@@ -3178,11 +3200,12 @@ class BatchAutoReviewDialog(QDialog):
         issue_data = item.data(Qt.ItemDataRole.UserRole)
         if not issue_data:
             return
+        # Store stub immediately as fallback in case the detail fetch fails
+        self._pending_result = issue_data
         api_url = issue_data.get("api_detail_url")
         if api_url:
             self.cv_cover.setText("Loading…")
             self.overwrite_btn.setEnabled(False)
-            self._pending_result = None
             if self.issue_thread and self.issue_thread.isRunning():
                 self.issue_thread.quit()
                 self.issue_thread.wait(1000)
@@ -3190,11 +3213,17 @@ class BatchAutoReviewDialog(QDialog):
             self.issue_thread.issue_ready.connect(self._on_full_issue_loaded)
             self.issue_thread.start()
         else:
-            self._pending_result = issue_data
             self.overwrite_btn.setEnabled(True)
             self._show_result_cover(issue_data)
 
     def _on_full_issue_loaded(self, full_data):
+        if not full_data or not isinstance(full_data, dict):
+            # Full detail fetch failed — fall back to the search result stub
+            item = self.results_list.currentItem()
+            if item:
+                stub = item.data(Qt.ItemDataRole.UserRole)
+                if stub and isinstance(stub, dict):
+                    full_data = stub
         if not full_data:
             self.cv_cover.setText("Load failed")
             return
@@ -3228,8 +3257,8 @@ class BatchAutoReviewDialog(QDialog):
         else:
             self.cv_cover.setText("No cover")
 
-    def _overwrite(self):
-        if not self._pending_result:
+    def _apply_overwrite_data(self, issue_data):
+        if not issue_data:
             return
         m = self._current()
         path = m.get("path") or m.get("file_path")
@@ -3237,15 +3266,59 @@ class BatchAutoReviewDialog(QDialog):
             QMessageBox.warning(self, "Overwrite Failed", "File not found.")
             return
         try:
-            xml_str = generate_comicinfo_xml(self._pending_result, path)
+            xml_str = generate_comicinfo_xml(issue_data, path)
             inject_metadata_into_cbz(path, xml_str)
-            m["issue_data"] = self._pending_result
+            m["issue_data"] = issue_data
             m["overwritten"] = True
             self._pending_result = None
             self.overwrite_btn.setEnabled(False)
             self._load_match()
         except Exception as e:
             QMessageBox.critical(self, "Overwrite Failed", str(e))
+
+    def _overwrite(self):
+        if not self._pending_result:
+            return
+        self._apply_overwrite_data(self._pending_result)
+
+    def _overwrite_with_ai(self):
+        m = self._current()
+        base = os.path.splitext(m.get("filename") or "")[0]
+        parsed = parse_comic_filename_full(base)
+        series = parsed.get("series", "")
+        issue = parsed.get("issue", "")
+        year = parsed.get("year", "")
+        subtitle = parsed.get("subtitle", "")
+        if issue:
+            query = f"{series} {issue} {year}".strip()
+        elif subtitle:
+            query = f"{series} {subtitle} {year}".strip()
+        else:
+            query = f"{series} {year}".strip()
+        if not query:
+            QMessageBox.warning(self, "AI Overwrite", "Could not build a query for this file.")
+            return
+
+        self.overwrite_ai_btn.setEnabled(False)
+        self.overwrite_ai_btn.setText("🤖 Searching AI...")
+        self.ai_thread = MiniAITaggerThread(query)
+
+        def _ai_ok(ai_data):
+            self.overwrite_ai_btn.setEnabled(True)
+            self.overwrite_ai_btn.setText("🤖 Overwrite with AI")
+            if not isinstance(ai_data, dict) or not ai_data:
+                QMessageBox.critical(self, "AI Overwrite Failed", "AI returned no metadata.")
+                return
+            self._apply_overwrite_data(ai_data)
+
+        def _ai_err(msg):
+            self.overwrite_ai_btn.setEnabled(True)
+            self.overwrite_ai_btn.setText("🤖 Overwrite with AI")
+            QMessageBox.critical(self, "AI Overwrite Failed", str(msg))
+
+        self.ai_thread.ai_ready.connect(_ai_ok)
+        self.ai_thread.error_signal.connect(_ai_err)
+        self.ai_thread.start()
 
 
 # ==============================================================================
@@ -3766,6 +3839,7 @@ class ComicMetadataDialog(QDialog):
         self.file_path = file_path
         self.xml_str   = xml_str
         self._editing  = False
+        self._saved_new_path = None  # set if CBR was converted to CBZ
 
         self.setWindowTitle(f"Metadata — {os.path.basename(file_path)}")
         self.resize(640, 720)
@@ -3888,16 +3962,62 @@ class ComicMetadataDialog(QDialog):
         lines.append("</ComicInfo>")
         return "\n".join(lines)
 
-    # ── Write back to the CBZ ──
+    # ── Write back to the archive (CBZ in place; CBR → CBZ via MetadataInjectorThread) ──
     def _save_changes(self):
         new_xml = self._build_xml()
-        try:
-            inject_metadata_into_cbz(self.file_path, new_xml)
-            QMessageBox.information(self, "Saved", "Metadata updated successfully!")
-            self.xml_str = new_xml   # keep in sync
-            self._toggle_edit()      # back to read-only
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Could not save metadata:\n{e}")
+        ext = os.path.splitext(self.file_path)[1].lower()
+        if ext == ".cbz":
+            try:
+                inject_metadata_into_cbz(self.file_path, new_xml)
+                QMessageBox.information(self, "Saved", "Metadata updated successfully!")
+                self.xml_str = new_xml
+                self._toggle_edit()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Could not save metadata:\n{e}")
+            return
+
+        if ext == ".cbr":
+            loop = QEventLoop(self)
+            outcome = {"ok": False, "msg": "", "path": None}
+
+            def _ok(msg, path):
+                outcome["ok"] = True
+                outcome["msg"] = msg
+                outcome["path"] = path
+                loop.quit()
+
+            def _err(msg):
+                outcome["msg"] = msg
+                loop.quit()
+
+            worker = MetadataInjectorThread(self.file_path, new_xml)
+            worker.success.connect(_ok)
+            worker.error.connect(_err)
+            worker.finished.connect(loop.quit)
+            worker.start()
+            loop.exec()
+            worker.wait(60_000)
+
+            if outcome["ok"]:
+                QMessageBox.information(self, "Saved", outcome["msg"] or "Metadata saved.")
+                self.xml_str = new_xml
+                if outcome["path"] and os.path.normpath(outcome["path"]) != os.path.normpath(
+                    self.file_path
+                ):
+                    self._saved_new_path = os.path.normpath(outcome["path"])
+                    self.file_path = self._saved_new_path
+                self._toggle_edit()
+            else:
+                QMessageBox.critical(
+                    self, "Error", outcome["msg"] or "Could not save metadata."
+                )
+            return
+
+        QMessageBox.warning(
+            self,
+            "Not supported",
+            "Metadata injection supports .cbz and .cbr only.",
+        )
 
 
 # ==============================================================================
@@ -5316,51 +5436,6 @@ class ComicBrowser(QMainWindow):
         else:
             self.info_box.setHtml(f"<h3 style='color: #ff5555;'>{message}</h3>")
 
-    # --- NEW PROGRESS HANDLERS ---
-    def update_convert_progress(self, current, total):
-        if total > 0:
-            percentage = int((current / total) * 100)
-            self.convert_progress.setValue(percentage)
-
-    def update_convert_status(self, msg):
-        self.action_btn.setText(msg)
-    # -----------------------------
-
-    def on_conversion_complete(self, success, message, new_path):
-        self.action_btn.setEnabled(True)
-        self.action_btn.setText("Convert/Tag CBR and Tag CBZ")
-        self.convert_progress.setVisible(False) # Hide progress bar when done
-        
-        if success:
-            self.current_comic_path = new_path
-            self.load_comic_data(new_path)
-            self.info_box.append(f"<h3 style='color: #50fa7b;'>{message}</h3>")
-        else:
-            self.info_box.setHtml(f"<h3 style='color: #ff5555;'>{message}</h3>")
-        
-        # We need to construct the XML string here to pass to the thread
-        # For now, it uses a generic string, but you can plug your Gemini summary in here!
-        xml_string = f"""<?xml version="1.0" encoding="utf-8"?>
-        <ComicInfo xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-          <Title>{os.path.splitext(filename)[0]}</Title>
-          <Summary>Summary goes here.</Summary>
-        </ComicInfo>"""
-
-        self.conversion_thread = ComicConverterThread(self.current_comic_path, xml_string)
-        self.conversion_thread.finished_conversion.connect(self.on_conversion_complete)
-        self.conversion_thread.start()
-
-    def on_conversion_complete(self, success, message, new_path):
-        self.action_btn.setEnabled(True)
-        self.action_btn.setText("Convert/Tag CBR and Tag CBZ")
-        
-        if success:
-            self.current_comic_path = new_path
-            self.load_comic_data(new_path)
-            self.info_box.append(f"<h3 style='color: #50fa7b;'>{message}</h3>")
-        else:
-            self.info_box.setHtml(f"<h3 style='color: #ff5555;'>{message}</h3>")
-
     def clear_image_cache(self):
         if os.path.exists(CACHE_DIR):
             shutil.rmtree(CACHE_DIR)
@@ -6054,6 +6129,8 @@ class ComicBrowser(QMainWindow):
             return
         dlg = ComicMetadataDialog(self._current_xml_str, self.current_comic_path, self)
         dlg.exec()
+        if getattr(dlg, "_saved_new_path", None):
+            self.current_comic_path = dlg._saved_new_path
         self.load_comic_data(self.current_comic_path)
 
     def _set_grid_item_icon(self, items, cover_bytes, w, h):
@@ -6266,6 +6343,8 @@ class ComicBrowser(QMainWindow):
             cbl_img_action     = menu.addAction("🖼️ Set Custom Image Cover")
             cbl_comic_action   = menu.addAction("📕 Pick Comic as Cover")
             cbl_reset_action   = menu.addAction("🔄 Reset to Default Cover")
+            menu.addSeparator()
+            cbl_delete_action  = menu.addAction("🗑️ Delete (Recycle Bin)")
             action = menu.exec(self.grid_list.mapToGlobal(pos))
             if action == open_cbl_action and os.path.exists(cbl_path):
                 self.tabs.setCurrentIndex(1)
@@ -6318,6 +6397,8 @@ class ComicBrowser(QMainWindow):
                             break
                     except RuntimeError:
                         pass
+            elif action == cbl_delete_action and os.path.exists(cbl_path):
+                self._grid_delete_paths_to_trash([os.path.normpath(cbl_path)])
             return
 
         link_action = menu.addAction("🔗 Smart-Link Comic(s)")
@@ -6329,6 +6410,8 @@ class ComicBrowser(QMainWindow):
         cover_img_action = menu.addAction("🖼️ Pick Custom Image Cover")
         menu.addSeparator()
         reset_action = menu.addAction("🔄 Reset to Default Cover")
+        menu.addSeparator()
+        delete_action = menu.addAction("🗑️ Delete (Recycle Bin)")
         menu.addSeparator()
         hide_action = menu.addAction("🙈 Hide Item (Remove from Grid)")
         
@@ -6373,8 +6456,94 @@ class ComicBrowser(QMainWindow):
                 
                 # 3. Pop it out of the grid UI instantly
                 self.grid_list.takeItem(self.grid_list.row(item))
-        elif action == reset_action:
-            self.reset_default_cover(item)
+        elif action == delete_action:
+            self._grid_delete_from_context(item)
+
+    def _grid_paths_from_grid_items(self, items):
+        """Resolve filesystem paths from grid QListWidgetItems (skips MISSING)."""
+        paths = []
+        for it in items:
+            user_str = str(it.data(Qt.ItemDataRole.UserRole) or "")
+            if user_str.startswith("MISSING:"):
+                continue
+            if user_str.startswith("FOLDER:"):
+                paths.append(os.path.normpath(user_str[7:]))
+            elif user_str.startswith("CBL:"):
+                paths.append(os.path.normpath(user_str[4:]))
+            else:
+                paths.append(os.path.normpath(user_str))
+        return [p for p in paths if os.path.exists(p)]
+
+    def _grid_delete_from_context(self, primary_item):
+        selected = self.grid_list.selectedItems()
+        if primary_item not in selected:
+            selected = [primary_item]
+        paths = self._grid_paths_from_grid_items(selected)
+        self._grid_delete_paths_to_trash(paths)
+
+    def _grid_delete_paths_to_trash(self, paths):
+        """Move files/folders to the system Recycle Bin (Qt QFile.moveToTrash)."""
+        paths = list(dict.fromkeys(paths))
+        paths = [p for p in paths if os.path.exists(p)]
+        if not paths:
+            QMessageBox.warning(self, "Delete", "Nothing to delete (missing files or invalid selection).")
+            return
+        n = len(paths)
+        preview = "\n".join(os.path.basename(p) for p in paths[:8])
+        if n > 8:
+            preview += f"\n… and {n - 8} more"
+        r = QMessageBox.question(
+            self,
+            "Delete",
+            f"Send {n} item(s) to the Recycle Bin?\n\n{preview}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if r != QMessageBox.StandardButton.Yes:
+            return
+        failed = []
+        for p in paths:
+            if not QFile.moveToTrash(p):
+                failed.append(p)
+                continue
+            try:
+                self.hidden_paths.discard(os.path.normpath(p))
+            except Exception:
+                pass
+            nh = hashlib.md5(os.path.normpath(p).encode("utf-8")).hexdigest()
+            cp = os.path.join(CACHE_DIR, f"custom_{nh}.jpg")
+            if os.path.isfile(cp):
+                try:
+                    os.remove(cp)
+                except OSError:
+                    pass
+        try:
+            self.save_hidden_paths()
+        except Exception:
+            pass
+        self.proxy_model.invalidateFilter()
+        cg = getattr(self, "current_grid_folder", None)
+        cbl_p = getattr(self, "current_cbl_path", None)
+        deleted_norms = {os.path.normpath(p) for p in paths}
+        if cbl_p and os.path.normpath(cbl_p) in deleted_norms:
+            self.current_cbl_path = None
+            if cg and os.path.isdir(cg):
+                self.load_folder_grid(cg)
+        elif (
+            cbl_p
+            and os.path.isfile(cbl_p)
+            and hasattr(self, "refresh_cbl_btn")
+            and self.refresh_cbl_btn.isVisible()
+        ):
+            self.refresh_current_cbl()
+        elif cg and os.path.isdir(cg):
+            self.load_folder_grid(cg)
+        if failed:
+            QMessageBox.warning(
+                self,
+                "Delete",
+                "Could not move to Recycle Bin:\n" + "\n".join(os.path.basename(f) for f in failed[:10]),
+            )
 
     def pick_custom_cover(self, item):
         
