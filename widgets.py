@@ -84,6 +84,7 @@ class ReadingDropListWidget(QListWidget):
             "series": parsed["series"],
             "issue": parsed["issue"],
             "year": parsed["year"],
+            "volume": parsed.get("volume") or "",
         })
         self.addItem(item)
 

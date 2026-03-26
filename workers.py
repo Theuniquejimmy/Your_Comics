@@ -28,6 +28,8 @@ from utils import (
     parse_comic_filename_full,
     generate_comicinfo_xml,
     inject_metadata_into_cbz,
+    atomic_replace_file,
+    force_delete_archive,
     _the_variants,
     _norm_vol_name,
     _score_volume,
@@ -493,7 +495,7 @@ class ComicConverterThread(QThread):
                     try:
                         if HAS_RAR:
                             with rarfile.RarFile(self.file_path, 'r') as rf:
-                                files = rf.infolist()
+                                files = [x for x in rf.infolist() if not x.isdir()]
                                 for i, f in enumerate(files):
                                     rf.extract(f, temp_dir)
                                     self.progress_update.emit(i + 1, len(files))
@@ -521,20 +523,25 @@ class ComicConverterThread(QThread):
                             continue
                         all_files.append(os.path.join(root, file))
 
-                with zipfile.ZipFile(temp_cbz, 'w', zipfile.ZIP_DEFLATED) as zf:
+                with zipfile.ZipFile(temp_cbz, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
                     for i, full_path in enumerate(all_files):
                         arcname = os.path.relpath(full_path, temp_dir)
                         zf.write(full_path, arcname)
                         self.progress_update.emit(i + 1, len(all_files))
 
                 self.status_update.emit("Finalizing file...")
-                os.replace(temp_cbz, new_cbz_path)
+                atomic_replace_file(new_cbz_path, temp_cbz)
 
-                if os.path.exists(self.file_path):
-                    try:
-                        os.remove(self.file_path)
-                    except Exception as _e:
-                        log.warning("Suppressed exception: %s", _e)
+                try:
+                    force_delete_archive(self.file_path)
+                except OSError as _e:
+                    log.warning("Could not delete source CBR %s: %s", self.file_path, _e)
+                    self.finished_conversion.emit(
+                        True,
+                        "Converted to CBZ, but the original CBR could not be deleted (in use or permissions).",
+                        new_cbz_path,
+                    )
+                    return
                 self.finished_conversion.emit(True, "Successfully converted CBR and tagged!", new_cbz_path)
 
         except Exception as e:
@@ -1184,6 +1191,300 @@ class BatchProcessorThread(QThread):
         self._is_running = False
 
 
+# --- ComicBookReadingOrders.com URL import (List Maker): expand "Read … here" links in order ---
+
+_CBRO_HEADERS = {"User-Agent": "ComicVault/1.0"}
+_CBRO_FETCH_TIMEOUT = 45
+_CBRO_MAX_DEPTH = 28
+_CBRO_MAX_PAGES = 80
+_CBRO_HOST_MARKER = "comicbookreadingorders.com"
+
+_READ_HERE_LINK_RE = re.compile(
+    r"Read\s*<a\s+[^>]*\bhref\s*=\s*[\"']([^\"']+)[\"'][^>]*>([^<]*)</a>\s*here\.?",
+    re.I | re.DOTALL,
+)
+_P_TAG_RE = re.compile(r"<p\b[^>]*>(.*?)</p\s*>", re.I | re.DOTALL)
+
+
+def _cbro_normalize_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not re.match(r"^https?://", url, re.I):
+        url = "https://" + url.lstrip("/")
+    p = urllib.parse.urlsplit(url)
+    fragless = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+    return fragless.rstrip("/") or fragless
+
+
+def _cbro_page_key(url: str) -> str:
+    p = urllib.parse.urlsplit(_cbro_normalize_url(url))
+    host = (p.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    path = (p.path or "").rstrip("/")
+    return f"{host}{path}".lower()
+
+
+def _is_cbro_followable_url(url: str) -> bool:
+    try:
+        p = urllib.parse.urlsplit(_cbro_normalize_url(url))
+    except Exception:
+        return False
+    host = (p.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host != _CBRO_HOST_MARKER:
+        return False
+    path = (p.path or "").lower()
+    if "reading-order" not in path:
+        return False
+    if "/wp-" in path or path.endswith((".jpg", ".png", ".gif", ".svg", ".css", ".js")):
+        return False
+    return True
+
+
+def _extract_first_url_from_query(q: str):
+    q = (q or "").strip()
+    m = re.search(r"https?://[^\s<>\"']+", q, re.I)
+    if m:
+        return m.group(0).rstrip(").,;]")
+    if _CBRO_HOST_MARKER in q.lower():
+        m2 = re.search(
+            r"(?:https?://)?(?:www\.)?comicbookreadingorders\.com/\S+",
+            q,
+            re.I,
+        )
+        if m2:
+            return _cbro_normalize_url(m2.group(0).rstrip(").,;]"))
+    return None
+
+
+def _slice_balanced_entry_content(html: str) -> str:
+    m = re.search(r'<div\s+class="entry-content\s+content"[^>]*>', html, re.I)
+    if not m:
+        return ""
+    start = m.end()
+    depth = 1
+    pos = start
+    n = len(html)
+    while pos < n and depth > 0:
+        div_open = html.find("<div", pos)
+        div_close = html.find("</div>", pos)
+        if div_close == -1:
+            return html[start:]
+        if div_open != -1 and div_open < div_close:
+            depth += 1
+            pos = div_open + 4
+        else:
+            depth -= 1
+            if depth == 0:
+                return html[start:div_close]
+            pos = div_close + 6
+    return html[start:]
+
+
+def _cbro_fetch_html(url: str) -> str:
+    u = _cbro_normalize_url(url)
+    r = requests.get(u, headers=_CBRO_HEADERS, timeout=_CBRO_FETCH_TIMEOUT)
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding or "utf-8"
+    return r.text
+
+
+def _html_para_to_text_lines(inner: str) -> list[str]:
+    t = re.sub(r"<br\s*/?>", "\n", inner, flags=re.I)
+    t = re.sub(r"<[^>]+>", "", t)
+    t = _html_mod.unescape(t)
+    out = []
+    for line in t.splitlines():
+        line = re.sub(r"\s+", " ", line).strip()
+        if line:
+            out.append(line)
+    return out
+
+
+def _line_looks_like_issue_entry(line: str) -> bool:
+    return bool(re.search(r"#\s*[\w./-]+", line))
+
+
+def _parse_cbro_issue_line(line: str):
+    line = re.sub(r"\s+", " ", line).strip()
+    if not line:
+        return None
+    line = re.sub(r"^First\s+appearance\s*:\s*", "", line, flags=re.I)
+    line = line.replace("\u2013", "-").replace("\u2014", "-")
+    mcol = re.search(r":\s*First appearance\b", line, re.I)
+    if mcol and re.search(r"#\s*[\w./-]+", line[: mcol.start()]):
+        line = line[: mcol.start()].strip()
+    if " - " in line:
+        left, _right = line.split(" - ", 1)
+        if re.search(r"#\s*[\w./-]+", left):
+            line = left.strip()
+    year = ""
+    ym = re.search(r"\((\d{4})\)\s*$", line)
+    if ym:
+        year = ym.group(1)
+        line = line[: ym.start()].strip()
+    m_vol_iss = re.match(
+        r"^(.+?)\s+vol(?:ume)?\.?\s*(\d+)\s*#\s*([\w./-]+)\s*$",
+        line,
+        re.I,
+    )
+    if m_vol_iss:
+        vn = m_vol_iss.group(2).lstrip("0") or m_vol_iss.group(2)
+        return {
+            "series": m_vol_iss.group(1).strip(),
+            "volume": vn,
+            "issue": m_vol_iss.group(3).strip(),
+            "year": year,
+        }
+    m = re.match(r"^(.+?)\s+#\s*([\w./-]+)\s*$", line)
+    if not m:
+        return None
+    return {"series": m.group(1).strip(), "volume": "", "issue": m.group(2).strip(), "year": year}
+
+
+def dedupe_cbro_items_by_series_and_issue(items):
+    """Drop later rows with the same series+issue+volume (keeps first: bio First Appearance before tab list)."""
+    if not items:
+        return
+    seen = set()
+    out = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        s, iss = it.get("series"), it.get("issue")
+        if s is None or iss is None:
+            out.append(it)
+            continue
+        vol = it.get("volume")
+        vol = "" if vol is None else str(vol).strip()
+        key = (str(s).strip().lower(), str(iss).strip().lower(), vol.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    items[:] = out
+
+
+def strip_first_appearance_notes_from_items(items):
+    """Remove 'First appearance…' annotations from series names (CBL should be series / issue / year only)."""
+    if not items:
+        return
+    tail = re.compile(r"\s*[-–—,:]\s*First appearance\b.*$", re.I)
+    paren = re.compile(r"\s*\([^)]*First appearance\b[^)]*\)", re.I)
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        s = it.get("series")
+        if s is None:
+            continue
+        s = str(s).strip()
+        s = re.sub(r"^First\s+appearance\s*:\s*", "", s, flags=re.I)
+        s = tail.sub("", s)
+        s = paren.sub("", s)
+        it["series"] = s.strip()
+
+
+def apply_series_year_carry_forward(items):
+    """Set missing year from the latest explicit year on the same series (list order)."""
+    if not items:
+        return
+    last_year = {}
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        s = it.get("series")
+        s = "" if s is None else str(s).strip()
+        if not s:
+            continue
+        y = it.get("year")
+        y = "" if y is None else str(y).strip()
+        if y:
+            last_year[s] = y
+        elif s in last_year:
+            it["year"] = last_year[s]
+
+
+def _ensure_item_volume_key(items):
+    for it in items or []:
+        if isinstance(it, dict) and "volume" not in it:
+            it["volume"] = ""
+
+
+def _cbro_page_title(html: str) -> str:
+    m = re.search(r"<title[^>]*>([^<]+)</title>", html, re.I)
+    if m:
+        return _html_mod.unescape(re.sub(r"\s+", " ", m.group(1)).strip())
+    return "ComicBookReadingOrders import"
+
+
+def _expand_cbro_fragment(fragment_html: str, visited: set[str], depth: int) -> list[str]:
+    out: list[str] = []
+    for pm in _P_TAG_RE.finditer(fragment_html):
+        inner = pm.group(1)
+        lm = _READ_HERE_LINK_RE.search(inner)
+        if lm:
+            href = lm.group(1).strip()
+            abs_url = urllib.parse.urljoin(f"https://{_CBRO_HOST_MARKER}/", href)
+            norm = _cbro_normalize_url(abs_url)
+            key = _cbro_page_key(norm)
+            if depth >= _CBRO_MAX_DEPTH or key in visited or not _is_cbro_followable_url(norm):
+                continue
+            if len(visited) >= _CBRO_MAX_PAGES:
+                out.append("[Skipped linked list: import page limit reached]")
+                continue
+            visited.add(key)
+            try:
+                sub_html = _cbro_fetch_html(norm)
+                sub_frag = _slice_balanced_entry_content(sub_html)
+                if sub_frag:
+                    out.extend(_expand_cbro_fragment(sub_frag, visited, depth + 1))
+            except Exception:
+                out.append(f"[Skipped linked list: could not load {_html_mod.escape(norm)}]")
+            continue
+        lines = _html_para_to_text_lines(inner)
+        if not any(_line_looks_like_issue_entry(ln) for ln in lines):
+            continue
+        out.extend(lines)
+    return out
+
+
+def build_reading_list_from_cbro_url(seed_url: str) -> dict:
+    norm = _cbro_normalize_url(seed_url)
+    if not _is_cbro_followable_url(norm):
+        raise ValueError("Not a ComicBookReadingOrders reading-order URL.")
+    visited: set[str] = {_cbro_page_key(norm)}
+    html = _cbro_fetch_html(norm)
+    title = _cbro_page_title(html)
+    frag = _slice_balanced_entry_content(html)
+    if not frag:
+        raise ValueError("Could not find reading list content on that page.")
+    lines = _expand_cbro_fragment(frag, visited, 0)
+    items: list[dict] = []
+    for ln in lines:
+        if ln.startswith("[Skipped"):
+            continue
+        parsed = _parse_cbro_issue_line(ln)
+        if parsed:
+            items.append(parsed)
+
+    dedupe_cbro_items_by_series_and_issue(items)
+    strip_first_appearance_notes_from_items(items)
+    apply_series_year_carry_forward(items)
+    _ensure_item_volume_key(items)
+
+    note = (
+        f"Imported from {norm} ({title}). "
+        f"Inlined {max(0, len(visited) - 1)} linked reading-order page(s) (e.g. 'Read ... here' event lists). "
+        f"{len(items)} issues parsed from {len(lines)} text lines."
+    )
+    return {"description": note, "items": items, "_cbro_source": norm, "_cbro_lines": len(lines)}
+
+
 class AIListGeneratorThread(QThread):
     list_ready = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
@@ -1193,6 +1494,24 @@ class AIListGeneratorThread(QThread):
         self.query = query
 
     def run(self):
+        seed = _extract_first_url_from_query(self.query)
+        if seed and _CBRO_HOST_MARKER in seed.lower():
+            try:
+                data = build_reading_list_from_cbro_url(seed)
+                if not data.get("items"):
+                    self.error_signal.emit(
+                        "That ComicBookReadingOrders page loaded, but no issues were recognized. "
+                        "Try a character or event URL that lists issues with # numbers."
+                    )
+                    return
+                self.list_ready.emit(
+                    {"description": data["description"], "items": data["items"]}
+                )
+                return
+            except Exception as e:
+                self.error_signal.emit(f"ComicBookReadingOrders import failed: {e}")
+                return
+
         if not GEMINI_KEY:
             self.error_signal.emit("Missing Gemini API Key!")
             return
@@ -1212,13 +1531,19 @@ class AIListGeneratorThread(QThread):
                 "You MUST return ONLY a raw JSON dictionary. Do not include markdown formatting.\n"
                 "The JSON must use these exact keys: 'description' and 'items'.\n"
                 "The 'description' should be a brief 2-3 sentence explanation of the reading order you compiled, explaining the scope and what is included.\n"
-                "The 'items' key must contain an array of objects with the keys: 'series', 'issue', and 'year'.\n\n"
+                "The 'items' key must contain an array of objects with keys: 'series', 'issue', 'year', and 'volume'.\n"
+                "Use 'volume' as the volume NUMBER only when the book is from a numbered volume (e.g. listings like 'Daredevil Vol. 2 #26' or 'Amazing Spider-Man Vol. 5 #26'): "
+                "set 'series' to the base title without the Vol. part (e.g. 'Daredevil'), 'volume' to '2', 'issue' to '26'. "
+                "When there is no volume, set 'volume' to \"\".\n"
+                "YEAR CONSISTENCY: When the first issue in a run shows a year (e.g. \"Warlock #1 (1972)\" or year field \"1972\"), "
+                "give every following item with the SAME series name the same year until that series shows a different year.\n\n"
                 "Example Format:\n"
                 "{\n"
                 '  "description": "This is the complete Marvel Civil War main event reading order, including the main 7 issues and essential tie-ins like Amazing Spider-Man.",\n'
                 '  "items": [\n'
-                '    {"series": "The Amazing Spider-Man", "issue": "529", "year": "2006"},\n'
-                '    {"series": "Civil War", "issue": "1", "year": "2006"}\n'
+                '    {"series": "The Amazing Spider-Man", "volume": "", "issue": "529", "year": "2006"},\n'
+                '    {"series": "Daredevil", "volume": "2", "issue": "26", "year": "1998"},\n'
+                '    {"series": "Civil War", "volume": "", "issue": "1", "year": "2006"}\n'
                 '  ]\n'
                 "}\n"
             )
@@ -1237,6 +1562,11 @@ class AIListGeneratorThread(QThread):
                 text = text[:-3].strip()
 
             ai_data = json.loads(text)
+            raw_items = ai_data.get("items")
+            if isinstance(raw_items, list):
+                _ensure_item_volume_key(raw_items)
+                strip_first_appearance_notes_from_items(raw_items)
+                apply_series_year_carry_forward(raw_items)
             self.list_ready.emit(ai_data)
 
         except Exception as e:
@@ -1270,7 +1600,7 @@ class GithubCBLFetchThread(QThread):
     results_ready = pyqtSignal(list)
     error_signal = pyqtSignal(str)
 
-    BASE = "https://api.github.com/repos/DieselTech/CBL-ReadingLists/contents/"
+    BASE = "https://api.github.com/repos/Theuniquejimmy/Your_Comic_cbls/contents/"
 
     def __init__(self, path=""):
         super().__init__()
@@ -1561,8 +1891,8 @@ class BatchTaggerThread(QThread):
 
             if not is_cbr and not self.overwrite_meta:
                 try:
-                    with zipfile.ZipFile(path, 'r') as zf:
-                        if 'ComicInfo.xml' in zf.namelist():
+                    with zipfile.ZipFile(path, 'r', allowZip64=True) as zf:
+                        if any(os.path.basename(n).lower() == 'comicinfo.xml' for n in zf.namelist()):
                             self.progress_update.emit(i, f"⏭️ Skipped {filename} (Already has metadata)")
                             continue
                 except Exception:
@@ -1814,7 +2144,7 @@ class BatchTaggerThread(QThread):
                                     shutil.rmtree(temp_dir, onerror=force_remove_readonly)
                         else:
                             try:
-                                with zipfile.ZipFile(path, 'r') as zf:
+                                with zipfile.ZipFile(path, 'r', allowZip64=True) as zf:
                                     images = sorted([f for f in zf.namelist() if f.lower().endswith(('.jpg', '.jpeg', '.png'))])
                                     if images:
                                         local_cover_bytes = zf.read(images[0])
@@ -1838,7 +2168,11 @@ class BatchTaggerThread(QThread):
                         try:
                             deep_resp = requests.get(f"{api_url}?api_key={COMIC_VINE_KEY}&format=json", headers=headers, timeout=10).json()
                             if deep_resp.get('error') == 'OK':
-                                issue_data = deep_resp.get('results', issue_data)
+                                raw = deep_resp.get('result') or deep_resp.get('results')
+                                if isinstance(raw, dict):
+                                    issue_data = raw
+                                elif isinstance(raw, list) and raw:
+                                    issue_data = raw[0]
                         except Exception as _e:
                             log.warning("Suppressed exception: %s", _e)
 
@@ -1982,7 +2316,7 @@ class BatchTaggerThread(QThread):
                     if not self.interactive:
                         local_cover_bytes = b""
                         try:
-                            with zipfile.ZipFile(written_path, 'r') as zf:
+                            with zipfile.ZipFile(written_path, 'r', allowZip64=True) as zf:
                                 imgs = sorted([f for f in zf.namelist()
                                                if f.lower().endswith(('.jpg', '.jpeg', '.png'))
                                                and not f.lower().endswith('comicinfo.xml')])
@@ -2066,7 +2400,26 @@ class BatchTaggerThread(QThread):
                             ET.SubElement(ai_ci, "PlayCount").text = "1"
                             ai_xml = '<?xml version="1.0" encoding="utf-8"?>\n' + ET.tostring(ai_ci, encoding='unicode')
 
-                            inject_metadata_into_cbz(path, ai_xml)
+                            if is_cbr:
+                                _ai_temp = tempfile.mkdtemp()
+                                try:
+                                    patoolib.extract_archive(path, outdir=_ai_temp, interactive=False)
+                                    _ai_files = [os.path.join(r, f) for r, _, fs in os.walk(_ai_temp) for f in fs]
+                                    _ai_cbz = os.path.splitext(path)[0] + '.cbz'
+                                    with zipfile.ZipFile(_ai_cbz, 'w', zipfile.ZIP_DEFLATED, allowZip64=True) as _zf:
+                                        for _fp in _ai_files:
+                                            _zf.write(_fp, os.path.relpath(_fp, _ai_temp))
+                                        _zf.writestr('ComicInfo.xml', ai_xml)
+                                    try:
+                                        force_delete_archive(path)
+                                    except OSError as _de:
+                                        log.warning("Could not delete CBR after AI tag %s: %s", path, _de)
+                                        self.progress_update.emit(
+                                            i, f"⚠️ AI CBZ created but could not delete {filename}: {_de}")
+                                finally:
+                                    shutil.rmtree(_ai_temp, onerror=force_remove_readonly)
+                            else:
+                                inject_metadata_into_cbz(path, ai_xml)
                             self.progress_update.emit(i, f"🤖 AI tagged: {filename}")
                         except Exception as _ae:
                             log.warning("AI fallback tag failed for %s: %s", filename, _ae)

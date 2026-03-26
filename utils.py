@@ -3,6 +3,7 @@ import html
 import os
 import re
 import stat
+import time
 import zipfile
 
 from config import PUB_COLOURS
@@ -137,28 +138,119 @@ def generate_comicinfo_xml(data, filepath):
     return "\n".join(filter(None, xml))
 
 
+def _ensure_archive_writable(filepath: str) -> None:
+    """Clear read-only so Windows can replace CBZ in place."""
+    try:
+        if os.path.isfile(filepath):
+            os.chmod(filepath, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        pass
+
+
+def force_delete_archive(filepath: str, max_attempts: int = 10) -> None:
+    """Remove an archive file, clearing read-only; brief retries for Windows locks."""
+    filepath = os.path.normpath(filepath)
+    if not os.path.isfile(filepath):
+        return
+    delay = 0.15
+    last_err: OSError | None = None
+    for attempt in range(max_attempts):
+        try:
+            _ensure_archive_writable(filepath)
+            os.remove(filepath)
+            return
+        except OSError as e:
+            last_err = e
+            if attempt + 1 < max_attempts:
+                time.sleep(delay)
+                delay = min(delay * 1.4, 1.0)
+    assert last_err is not None
+    raise last_err
+
+
+def _safe_zipinfo_copy(src: zipfile.ZipInfo, arcname: str) -> zipfile.ZipInfo:
+    """Build ZipInfo from an existing member; tolerate bad timestamps from third-party zips."""
+    dt = src.date_time
+    if not isinstance(dt, tuple) or len(dt) != 6:
+        dt = (1980, 1, 1, 0, 0, 0)
+    else:
+        y, mo, d, h, mi, s = dt
+        try:
+            if not (1980 <= int(y) <= 2100 and 1 <= int(mo) <= 12 and 1 <= int(d) <= 31
+                    and 0 <= int(h) <= 23 and 0 <= int(mi) <= 59 and 0 <= int(s) <= 59):
+                dt = (1980, 1, 1, 0, 0, 0)
+        except (TypeError, ValueError):
+            dt = (1980, 1, 1, 0, 0, 0)
+    try:
+        zi = zipfile.ZipInfo(filename=arcname, date_time=dt)
+    except (ValueError, TypeError, OSError):
+        zi = zipfile.ZipInfo(filename=arcname, date_time=(1980, 1, 1, 0, 0, 0))
+    zi.compress_type = src.compress_type
+    zi.external_attr = src.external_attr
+    zi.create_system = src.create_system
+    zi.flag_bits = src.flag_bits
+    return zi
+
+
+def atomic_replace_file(dest: str, src: str) -> None:
+    """Replace dest with src; fall back to remove+rename when os.replace fails (e.g. Windows)."""
+    dest = os.path.normpath(dest)
+    src = os.path.normpath(src)
+    _ensure_archive_writable(dest)
+    try:
+        os.replace(src, dest)
+    except OSError:
+        _ensure_archive_writable(dest)
+        if os.path.isfile(dest):
+            os.remove(dest)
+        os.rename(src, dest)
+
+
 def inject_metadata_into_cbz(filepath: str, xml_string: str) -> None:
     """Append or replace ComicInfo.xml inside a CBZ file. Raises on failure."""
-    with zipfile.ZipFile(filepath, 'r') as zin:
-        has_xml = any(f.lower() == 'comicinfo.xml' for f in zin.namelist())
+    filepath = os.path.normpath(filepath)
+    xml_bytes = xml_string.encode("utf-8")
+
+    with zipfile.ZipFile(filepath, "r", allowZip64=True) as zin:
+        names = zin.namelist()
+        has_xml = any(os.path.basename(n).lower() == "comicinfo.xml" for n in names)
+
+    _ensure_archive_writable(filepath)
 
     if not has_xml:
-        with zipfile.ZipFile(filepath, 'a', zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr('ComicInfo.xml', xml_string.encode('utf-8'))
+        with zipfile.ZipFile(filepath, "a", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            zf.writestr(
+                "ComicInfo.xml",
+                xml_bytes,
+                compress_type=zipfile.ZIP_DEFLATED,
+            )
         return
 
-    temp_path = filepath + ".tmp"
+    temp_path = filepath + ".comicvault_meta.tmp"
     try:
-        with zipfile.ZipFile(filepath, 'r') as zin, \
-             zipfile.ZipFile(temp_path, 'w', zipfile.ZIP_DEFLATED) as zout:
-            for item in zin.infolist():
-                if item.filename.lower() != 'comicinfo.xml':
-                    zout.writestr(item, zin.read(item.filename))
-            zout.writestr('ComicInfo.xml', xml_string.encode('utf-8'))
-        os.replace(temp_path, filepath)
+        with zipfile.ZipFile(filepath, "r", allowZip64=True) as zin, zipfile.ZipFile(
+            temp_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True
+        ) as zout:
+            for name in names:
+                if not name or name.endswith("/"):
+                    continue
+                if os.path.basename(name).lower() == "comicinfo.xml":
+                    continue
+                src = zin.getinfo(name)
+                data = zin.read(name)
+                zi = _safe_zipinfo_copy(src, name)
+                zout.writestr(zi, data)
+            ci = zipfile.ZipInfo(filename="ComicInfo.xml", date_time=(1980, 1, 1, 0, 0, 0))
+            ci.compress_type = zipfile.ZIP_DEFLATED
+            zout.writestr(ci, xml_bytes)
+        _ensure_archive_writable(filepath)
+        atomic_replace_file(filepath, temp_path)
     except Exception:
         if os.path.exists(temp_path):
-            os.remove(temp_path)
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
         raise
 
 
@@ -373,18 +465,26 @@ def parse_comic_filename_full(base_name: str) -> dict:
 
 
 def parse_comic_filename(path: str) -> dict:
-    """Return {'series', 'issue', 'year', 'display'} parsed from a file path."""
+    """Return {'series', 'issue', 'year', 'volume', 'display'} parsed from a file path."""
     base_name = os.path.splitext(os.path.basename(path))[0]
     y_match = re.search(r'\((\d{4})\)', base_name)
     year = y_match.group(1) if y_match else ""
     clean_name = re.sub(r'\(.*?\)|\[.*?\]', '', base_name).strip()
+    vol_m = re.search(r'(?i)\b(?:v|vol|volume)\.?\s*(\d+)', clean_name)
+    volume = str(int(vol_m.group(1))) if vol_m else ""
     match = re.search(r'^(.*?)\s*#\s*(\d+)', clean_name) or \
             re.search(r'^(.*?)\s+(\d+)\s*$', clean_name)
     series = match.group(1).strip() if match else clean_name
     series = re.sub(r'\s+(?:v|vol|volume)\.?\s*\d+$', '', series, flags=re.IGNORECASE).strip()
     issue = str(int(match.group(2))) if match else ""
-    display = f"{series} #{issue}" + (f" ({year})" if year else "")
-    return {"series": series, "issue": issue, "year": year, "display": display}
+    disp = series
+    if volume:
+        disp += f" Vol. {volume}"
+    if issue:
+        disp += f" #{issue}"
+    if year:
+        disp += f" ({year})"
+    return {"series": series, "issue": issue, "year": year, "volume": volume, "display": disp}
 
 
 def _gc_first_article(html: str) -> str:

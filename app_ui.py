@@ -437,7 +437,7 @@ class ListMakerTab(QWidget):
         right_layout.setContentsMargins(0, 0, 0, 10)
 
         dt_header_layout = QHBoxLayout()
-        dt_label = QLabel("📚 DieselTech's CBLs")
+        dt_label = QLabel("📚 Your Comics .cbls")
         dt_label.setStyleSheet("color: #ffb86c; font-weight: bold; font-size: 13px;")
         dt_header_layout.addWidget(dt_label)
         dt_header_layout.addStretch()
@@ -500,7 +500,9 @@ class ListMakerTab(QWidget):
         ai_layout = QHBoxLayout()
         ai_layout.addWidget(QLabel("🤖 Ask AI to make me a list:"))
         self.ai_input = QLineEdit()
-        self.ai_input.setPlaceholderText("e.g. Marvel Civil War Main Event, or Batman Knightfall...")
+        self.ai_input.setPlaceholderText(
+            "Topic, or paste a ComicBookReadingOrders URL (follows 'Read ... here' links into event lists)"
+        )
         self.ai_input.returnPressed.connect(self.generate_ai_list)
 
         self.ai_btn = QPushButton("Go")
@@ -695,7 +697,19 @@ class ListMakerTab(QWidget):
             return
 
         self.ai_btn.setEnabled(False)
-        self.status_label.setText("⏳ AI is searching and compiling (this may take a moment for large lists)...")
+        ql = query.lower()
+        if ql.startswith(("http://", "https://")) and "comicbookreadingorders.com" in ql:
+            self.status_label.setText(
+                "⏳ Fetching ComicBookReadingOrders and inlining linked lists (can take a while)..."
+            )
+        elif "comicbookreadingorders.com/" in ql:
+            self.status_label.setText(
+                "⏳ Fetching ComicBookReadingOrders and inlining linked lists (can take a while)..."
+            )
+        else:
+            self.status_label.setText(
+                "⏳ AI is searching and compiling (this may take a moment for large lists)..."
+            )
 
         self.ai_thread = AIListGeneratorThread(query)
         self.ai_thread.list_ready.connect(self.on_ai_success)
@@ -721,11 +735,19 @@ class ListMakerTab(QWidget):
                 series = book.get('series', '')
                 issue = book.get('issue', '')
                 year = book.get('year', '')
-                display = f"{series} #{issue}" if issue else series
+                volume = book.get('volume') or ''
+                display = series
+                if volume:
+                    display += f" Vol. {volume}"
+                if issue:
+                    display += f" #{issue}"
                 if year:
                     display += f" ({year})"
                 item = QListWidgetItem(f"✨ {display}")
-                item.setData(Qt.ItemDataRole.UserRole, {"series": series, "issue": issue, "year": year})
+                item.setData(
+                    Qt.ItemDataRole.UserRole,
+                    {"series": series, "issue": issue, "year": year, "volume": volume},
+                )
                 self.active_list.addItem(item)
         else:
             self.status_label.setText("❌ AI list discarded by user.")
@@ -765,8 +787,10 @@ class ListMakerTab(QWidget):
                 book_attrs = {"Series": data["series"]}
                 if data["issue"]:
                     book_attrs["Number"] = data["issue"]
-                if data["year"]:
+                if data.get("year"):
                     book_attrs["Year"] = data["year"]
+                if data.get("volume"):
+                    book_attrs["Volume"] = str(data["volume"]).strip()
                 ET.SubElement(books_node, "Book", book_attrs)
 
         tree = ET.ElementTree(root)
@@ -1355,7 +1379,11 @@ class ComicFinderTab(QWidget):
     def on_summary_ready(self, summary_text):
         self.current_summary_text = summary_text
         html = markdown.markdown(summary_text)
-        self.summary_display.setHtml(f"<h2>{self.current_title}</h2>" + html)
+        # Wrap in a larger font so the summary text is easier to read.
+        self.summary_display.setHtml(
+            f"<h2>{self.current_title}</h2>"
+            f"<div style='font-size: 16px; line-height: 1.4;'>{html}</div>"
+        )
         self.export_epub_btn.setEnabled(True)
         
         self.analysis_completed.emit(self.current_title, summary_text)
@@ -4088,8 +4116,12 @@ class ComicBrowser(QMainWindow):
         self.grid_folder_map = getattr(self, 'grid_folder_map', {})
         self.grid_folder_map.clear()
         
-        if hasattr(self, 'refresh_cbl_btn'): self.refresh_cbl_btn.hide()
-        if hasattr(self, 'cbl_stats_label'): self.cbl_stats_label.hide()
+        if hasattr(self, 'refresh_cbl_btn'):
+            self.refresh_cbl_btn.hide()
+        if hasattr(self, 'copy_cbl_to_folder_btn'):
+            self.copy_cbl_to_folder_btn.hide()
+        if hasattr(self, 'cbl_stats_label'):
+            self.cbl_stats_label.hide()
 
         if getattr(self, 'cover_thread', None) and self.cover_thread.isRunning():
             self.cover_thread.stop()
@@ -4534,14 +4566,24 @@ class ComicBrowser(QMainWindow):
         self.refresh_cbl_btn = QPushButton("🔄 Refresh Active Reading List")
         self.refresh_cbl_btn.setStyleSheet("background-color: #ffb86c; color: #282a36; font-weight: bold; padding: 5px;")
         self.refresh_cbl_btn.clicked.connect(self.refresh_current_cbl)
-        self.refresh_cbl_btn.hide() 
-        
+        self.refresh_cbl_btn.hide()
+
+        self.copy_cbl_to_folder_btn = QPushButton("📁 Copy Comics to Folder")
+        self.copy_cbl_to_folder_btn.setStyleSheet("background-color: #8be9fd; color: #282a36; font-weight: bold; padding: 5px;")
+        self.copy_cbl_to_folder_btn.clicked.connect(self.copy_cbl_grid_comics_to_folder)
+        self.copy_cbl_to_folder_btn.setToolTip(
+            "Copy matched comics with zero-padded list order (001…), issue (#009), and volume (vol. 002) "
+            "so filenames sort in reading order."
+        )
+        self.copy_cbl_to_folder_btn.hide()
+
         self.grid_top_layout.addWidget(self.grid_title_label)
         self.grid_top_layout.addWidget(self.grid_up_btn)
         self.grid_top_layout.addWidget(self.grid_fwd_btn)
         self.grid_top_layout.addWidget(self.cbl_stats_label)
-        self.grid_top_layout.addStretch() 
+        self.grid_top_layout.addStretch()
         self.grid_top_layout.addWidget(self.refresh_cbl_btn)
+        self.grid_top_layout.addWidget(self.copy_cbl_to_folder_btn)
         self.grid_layout.addLayout(self.grid_top_layout)
 
         # 2. Create and add the grid list below it
@@ -5116,8 +5158,12 @@ class ComicBrowser(QMainWindow):
             self.grid_list.addItem("❌ No matches found in your library.")
             return
             
-        if hasattr(self, 'refresh_cbl_btn'): self.refresh_cbl_btn.hide()
-        if hasattr(self, 'cbl_stats_label'): self.cbl_stats_label.hide()
+        if hasattr(self, 'refresh_cbl_btn'):
+            self.refresh_cbl_btn.hide()
+        if hasattr(self, 'copy_cbl_to_folder_btn'):
+            self.copy_cbl_to_folder_btn.hide()
+        if hasattr(self, 'cbl_stats_label'):
+            self.cbl_stats_label.hide()
             
         self.grid_list.setUpdatesEnabled(False)
         directory_items = []
@@ -5446,7 +5492,200 @@ class ComicBrowser(QMainWindow):
         if hasattr(self, 'current_cbl_path') and self.current_cbl_path:
             # Force the grid to ignore the cache and rescan your hard drive
             self.load_cbl_grid(self.current_cbl_path, force_refresh=True)
-            
+
+    def _sanitize_reading_order_copy_stem(self, grid_label_text, fallback_stem):
+        t = (grid_label_text or "").replace("\n", " ").strip()
+        t = re.sub(r"^[✅❌\s]+", "", t)
+        t = t.replace("❌ MISSING", "").strip()
+        for ch in '<>:"/\\|?*':
+            t = t.replace(ch, "")
+        t = re.sub(r"\s+", " ", t).strip().lower()
+        if not t or len(t) < 2:
+            t = re.sub(r"[^\w\-.]", "_", fallback_stem, flags=re.I).strip("._")[:120]
+        if len(t) > 200:
+            t = t[:200].rstrip()
+        return t or "comic"
+
+    def _cbl_book_field(self, book, name: str) -> str:
+        """Attribute (ComicRack-style) or child element (some exports)."""
+        if book is None:
+            return ""
+        v = book.get(name)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+        el = book.find(name)
+        if el is not None and el.text and str(el.text).strip():
+            return str(el.text).strip()
+        return ""
+
+    def _cbl_all_books_from_path(self, cbl_path: str):
+        try:
+            root = ET.parse(cbl_path).getroot()
+        except Exception:
+            return []
+        books = root.findall(".//Book")
+        if books:
+            return books
+        return [
+            el
+            for el in root.iter()
+            if el.tag == "Book" or (isinstance(el.tag, str) and el.tag.endswith("}Book"))
+        ]
+
+    def _pad_int_token_for_filename_sort(self, raw: str) -> str:
+        """Pad 1–999 to 3 digits so 002 sorts before 010 before 100."""
+        if not raw or not str(raw).strip():
+            return ""
+        s = str(raw).strip()
+        m = re.match(r"^(\d+)([a-zA-Z]?)$", s)
+        if not m:
+            return s
+        n, suf = int(m.group(1)), m.group(2) or ""
+        if n < 1000:
+            return f"{n:03d}{suf}"
+        return f"{n}{suf}"
+
+    def _reading_order_copy_stem_from_cbl_book(self, book) -> str:
+        """Stem from CBL metadata: padded list slot is separate; here issue + vol sort correctly."""
+        series = self._cbl_book_field(book, "Series")
+        num_raw = self._cbl_book_field(book, "Number")
+        year = self._cbl_book_field(book, "Year")
+        vol = self._cbl_book_field(book, "Volume")
+        padded_num = self._pad_int_token_for_filename_sort(num_raw) if num_raw else ""
+        vol_part = ""
+        if vol and re.match(r"^\d+$", vol.strip()):
+            vol_part = f"vol. {int(vol.strip()):03d}"
+        elif vol:
+            vol_part = f"vol. {vol.strip()}"
+        parts = []
+        if series:
+            parts.append(series.lower())
+        if vol_part:
+            parts.append(vol_part)
+        if padded_num:
+            parts.append(f"#{padded_num}")
+        elif num_raw:
+            parts.append(f"#{num_raw}")
+        stem = " ".join(parts)
+        for ch in '<>:"/\\|?*':
+            stem = stem.replace(ch, "")
+        stem = re.sub(r"\s+", " ", stem).strip()
+        if year and re.match(r"^\d{4}$", year.strip()):
+            stem += f" ({year.strip()})"
+        elif year:
+            stem += f" ({year.strip()})"
+        return stem or "comic"
+
+    def _pad_issue_numbers_in_copy_filename_stem(self, stem: str) -> str:
+        """Pad #issues in free-text stems; normalize fullwidth #."""
+        stem = stem.replace("\uff03", "#")
+
+        def repl(m):
+            digits, suffix = m.group(1), m.group(2) or ""
+            if not digits.isdigit():
+                return m.group(0)
+            n = int(digits)
+            if n < 1000:
+                return f"#{n:03d}{suffix}"
+            return f"#{digits}{suffix}"
+
+        stem = re.sub(r"#(\d+)([a-zA-Z]?)", repl, stem)
+
+        def vol_repl(m):
+            d = m.group(1)
+            if not d.isdigit():
+                return m.group(0)
+            n = int(d)
+            if n < 1000:
+                return f"vol. {n:03d}"
+            return f"vol. {n}"
+
+        return re.sub(r"(?i)\bvol\.?\s*(\d+)", vol_repl, stem)
+
+    def copy_cbl_grid_comics_to_folder(self):
+        if not getattr(self, "current_cbl_path", None):
+            QMessageBox.information(
+                self, "Reading list", "Open a .cbl reading list in the grid first."
+            )
+            return
+
+        books_list = self._cbl_all_books_from_path(self.current_cbl_path)
+
+        n = self.grid_list.count()
+        slot_width = max(3, len(str(n)))
+        entries = []
+        for row in range(n):
+            it = self.grid_list.item(row)
+            data = it.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(data, str) or not data:
+                continue
+            if data.startswith("MISSING:"):
+                continue
+            src = os.path.normpath(data)
+            if not os.path.isfile(src):
+                continue
+            entries.append((row + 1, row, src, it.text()))
+
+        if not entries:
+            QMessageBox.warning(
+                self,
+                "Nothing to copy",
+                "No matched comics on disk in this list (all missing or empty grid).",
+            )
+            return
+
+        last = APP_SETTINGS.get("last_cbl_reading_copy_dir", "")
+        dest = QFileDialog.getExistingDirectory(
+            self,
+            "Select folder for numbered copies (originals stay in place)",
+            last or "",
+        )
+        if not dest:
+            return
+
+        APP_SETTINGS["last_cbl_reading_copy_dir"] = dest
+        try:
+            with open("settings.json", "w") as f:
+                json.dump(APP_SETTINGS, f)
+        except Exception as _e:
+            log.warning("Suppressed exception: %s", _e)
+
+        copied = 0
+        errors = []
+        for slot, row_idx, src, label in entries:
+            ext = os.path.splitext(src)[1].lower()
+            if not ext:
+                ext = ".cbz"
+            fb = os.path.splitext(os.path.basename(src))[0]
+            book = books_list[row_idx] if row_idx < len(books_list) else None
+            if book is not None and self._cbl_book_field(book, "Series"):
+                stem = self._reading_order_copy_stem_from_cbl_book(book)
+            else:
+                stem = self._sanitize_reading_order_copy_stem(label, fb)
+                stem = self._pad_issue_numbers_in_copy_filename_stem(stem)
+            slot_padded = format(slot, f"0{slot_width}d")
+            base = f"{slot_padded} {stem}"
+            out_name = base + ext
+            out_path = os.path.join(dest, out_name)
+            c = 0
+            while os.path.exists(out_path):
+                c += 1
+                out_path = os.path.join(dest, f"{base}_{c}{ext}")
+            try:
+                shutil.copy2(src, out_path)
+                copied += 1
+            except OSError as e:
+                errors.append((src, str(e)))
+
+        msg = f"Copied {copied} file(s) to:\n{dest}"
+        if errors:
+            msg += f"\n\nFailed ({len(errors)}):"
+            for ep, err in errors[:5]:
+                msg += f"\n{os.path.basename(ep)}: {err}"
+            if len(errors) > 5:
+                msg += f"\n… and {len(errors) - 5} more."
+        QMessageBox.information(self, "Copy complete", msg)
+
     def load_cbl_grid(self, cbl_path, force_refresh=False):
         self.grid_list.clear()
         self.grid_items_map.clear()
@@ -5454,6 +5693,8 @@ class ComicBrowser(QMainWindow):
         
         if hasattr(self, 'refresh_cbl_btn'):
             self.refresh_cbl_btn.show()
+        if hasattr(self, 'copy_cbl_to_folder_btn'):
+            self.copy_cbl_to_folder_btn.show()
             
         # Hide the folder navigation when viewing a reading list!
         if hasattr(self, 'grid_up_btn'):
@@ -5567,9 +5808,39 @@ class ComicBrowser(QMainWindow):
                                     f_issue = m_trap.group(1).lstrip('0') or "0"
                                     f_series = clean_name[:m_trap.start()].strip()
                                     
+                                f_volume = ""
+                                vm_name = re.search(r'(?i)\b(?:v|vol|volume)\.?\s*(\d+)', clean_name)
+                                if vm_name:
+                                    try:
+                                        f_volume = str(int(vm_name.group(1)))
+                                    except ValueError:
+                                        f_volume = vm_name.group(1).strip()
+                                if not f_volume:
+                                    vm_dir = re.search(
+                                        r'(?i)\b(?:v|vol|volume)\.?\s*(\d+)',
+                                        os.path.basename(dirpath),
+                                    )
+                                    if vm_dir:
+                                        try:
+                                            f_volume = str(int(vm_dir.group(1)))
+                                        except ValueError:
+                                            f_volume = vm_dir.group(1).strip()
+
                                 local_inventory.append({
-                                    'path': full_path, 'series': f_series.lower(), 'issue': f_issue, 'year': f_year
+                                    'path': full_path,
+                                    'series': f_series.lower(),
+                                    'issue': f_issue,
+                                    'year': f_year,
+                                    'volume': f_volume,
                                 })
+
+                def norm_cbl_vol(v):
+                    if not v:
+                        return ""
+                    d = re.sub(r'\D', '', str(v))
+                    if d.isdigit():
+                        return str(int(d))
+                    return str(v).strip().lower()
 
                 def clean_for_match(text):
                                     t = str(text).lower().replace('&', 'and')
@@ -5601,6 +5872,8 @@ class ComicBrowser(QMainWindow):
                     c_series = book.get('Series', '')
                     c_num_raw = book.get('Number', '').strip()
                     c_year = book.get('Year', '').strip()
+                    c_volume = (book.get('Volume') or '').strip()
+                    c_nv = norm_cbl_vol(c_volume)
 
                     num_match = re.search(r'(\d+[a-zA-Z]?)', c_num_raw)
                     c_num = num_match.group(1).lstrip('0') or "0" if num_match else ""
@@ -5617,8 +5890,13 @@ class ComicBrowser(QMainWindow):
                                 c_series = c_series[:end_num_match.start()].strip()
 
                     display_num = c_num_raw if c_num_raw else c_num
-                    display_name = f"{c_series} #{display_num}" if display_num else c_series
-                    if c_year: display_name += f"\n({c_year})"
+                    display_name = c_series
+                    if c_volume:
+                        display_name += f" Vol. {c_volume}"
+                    if display_num:
+                        display_name += f" #{display_num}"
+                    if c_year:
+                        display_name += f"\n({c_year})"
 
                     c_clean = clean_for_match(c_series)
                     c_core = get_core_title(c_clean)
@@ -5653,7 +5931,12 @@ class ComicBrowser(QMainWindow):
                         elif c_num == "":
                             issue_match = True
                             
-                        if not issue_match: continue
+                        if not issue_match:
+                            continue
+
+                        f_nv = norm_cbl_vol(comic.get('volume') or '')
+                        if c_nv and f_nv and c_nv != f_nv:
+                            continue
 
                         f_clean = clean_for_match(comic['series'])
                         f_core = get_core_title(f_clean)
@@ -5716,6 +5999,8 @@ class ComicBrowser(QMainWindow):
                                         is_match, score = True, int(ratio * 100)
 
                         if is_match:
+                            if c_nv and f_nv and c_nv == f_nv:
+                                score += 14
                             if c_year and comic['year']:
                                 try:
                                     y_diff = abs(int(c_year) - int(comic['year']))
@@ -5724,16 +6009,26 @@ class ComicBrowser(QMainWindow):
                                     elif y_diff > 2: 
                                         is_any_coll = (c_is_epic or f_is_epic or c_is_mw or f_is_mw or c_is_omni or f_is_omni or c_is_comp or f_is_comp or c_is_tpb or f_is_tpb or "collection" in c_clean or "collection" in f_clean)
                                         if not is_any_coll:
-                                            # --- DOUBLE SHIELD 2: THE LETHAL YEAR PENALTY ---
-                                            # Drops a 100% match to a 30% score (Instant Fail)
-                                            score -= 70 
+                                            if not (c_nv and f_nv and c_nv == f_nv):
+                                                # --- DOUBLE SHIELD 2: THE LETHAL YEAR PENALTY ---
+                                                # Drops a 100% match to a 30% score (Instant Fail)
+                                                score -= 70 
                                 except ValueError: pass
+                            elif (not c_year) and c_nv and f_nv and c_nv == f_nv:
+                                score += 12
                                 
                             if score >= 40 and score > best_score:
                                 best_score = score
                                 found_path = comic['path']
 
-                    search_query = f"MISSING:{c_series} {c_num} {c_year}".strip()
+                    sq = [c_series]
+                    if c_volume:
+                        sq.append(f"Vol.{c_volume}")
+                    if c_num:
+                        sq.append(c_num)
+                    if c_year:
+                        sq.append(c_year)
+                    search_query = "MISSING:" + " ".join(sq)
                     matches_to_draw.append({
                         "display_name": display_name,
                         "path": found_path if found_path else "",
@@ -6113,7 +6408,8 @@ class ComicBrowser(QMainWindow):
                         {arc_html}
                         <div><b>Writer:</b> {writer}</div>
                         <div><b>Artist:</b> {artist}</div>
-                        <hr><div>{summary}</div>
+                        <!-- Summary text is visually too small by default; bump it up. -->
+                        <hr style="margin: 6px 0;"><div style="font-size: 16px; line-height: 1.2;">{summary}</div>
                     """
                     self.info_box.setHtml(html_content)
                 else:

@@ -47,6 +47,7 @@ APP_SETTINGS = {
     "last_dl_dir": "",
     "last_cbl_dir": "",
     "follow_collections": False,
+    "theme": "dracula",
 }
 
 if os.path.exists("settings.json"):
