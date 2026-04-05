@@ -44,6 +44,7 @@ A visual grid browser for your collection.
 - **Right-click context menu** on any item:
   - Smart-Link Comic(s) — match missing files in a CBL reading list
   - Send to Tagger
+  - What's this about? - Send comic, folder or cbl information to chat for detailed suammry.
   - Go to File Location — expands and highlights the item in the left-panel tree
   - Change Cover — pick an internal page, another comic's cover, or a custom image
   - Pick Comic as Cover / Reset to Default Cover
