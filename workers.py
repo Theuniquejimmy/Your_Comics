@@ -1259,6 +1259,14 @@ def _extract_first_url_from_query(q: str):
         )
         if m2:
             return _cbro_normalize_url(m2.group(0).rstrip(").,;]"))
+    if "marvel.com/comics/guides" in q.lower():
+        m3 = re.search(
+            r"(?:https?://)?(?:www\.)?marvel\.com/comics/guides/\S+",
+            q,
+            re.I,
+        )
+        if m3:
+            return _marvel_normalize_url(m3.group(0).rstrip(").,;]"))
     return None
 
 
@@ -1485,6 +1493,109 @@ def build_reading_list_from_cbro_url(seed_url: str) -> dict:
     return {"description": note, "items": items, "_cbro_source": norm, "_cbro_lines": len(lines)}
 
 
+# --- Marvel.com reading guide URL import (List Maker): ordered issue cards on /comics/guides/ pages ---
+_MARVEL_FETCH_TIMEOUT = 45
+_MARVEL_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+_MARVEL_GUIDE_CARD_TITLE_RE = re.compile(
+    r'data-testid="comic_card_title"[^>]*>\s*<a[^>]+href="(/comics/issue/\d+/[^"]+)"[^>]*>([^<]+)</a>',
+    re.I,
+)
+
+
+def _marvel_normalize_url(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = "https:" + url
+    elif not re.match(r"^https?://", url, re.I):
+        url = "https://" + url.lstrip("/")
+    p = urllib.parse.urlsplit(url)
+    fragless = urllib.parse.urlunsplit((p.scheme, p.netloc, p.path, "", ""))
+    return fragless.rstrip("/") or fragless
+
+
+def _is_marvel_guide_url(url: str) -> bool:
+    try:
+        p = urllib.parse.urlsplit(_marvel_normalize_url(url))
+    except Exception:
+        return False
+    host = (p.netloc or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host != "marvel.com":
+        return False
+    return "/comics/guides/" in (p.path or "").lower()
+
+
+def _marvel_fetch_html(url: str) -> str:
+    u = _marvel_normalize_url(url)
+    r = requests.get(u, headers=_MARVEL_HEADERS, timeout=_MARVEL_FETCH_TIMEOUT)
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding or "utf-8"
+    return r.text
+
+
+def _parse_marvel_issue_card_title(text: str):
+    """Parse link text like 'Friendly Neighborhood Spider-Man (2005) #1'."""
+    text = _html_mod.unescape((text or "").strip())
+    text = re.sub(r"\s+", " ", text)
+    if not text:
+        return None
+    m = re.match(r"^(.+?)\s+\((\d{4})\)\s+#\s*([\w./-]+)\s*$", text)
+    if m:
+        return {
+            "series": m.group(1).strip(),
+            "volume": "",
+            "issue": m.group(3).strip(),
+            "year": m.group(2),
+        }
+    m2 = re.match(r"^(.+?)\s+#\s*([\w./-]+)\s*$", text)
+    if m2:
+        return {
+            "series": m2.group(1).strip(),
+            "volume": "",
+            "issue": m2.group(2).strip(),
+            "year": "",
+        }
+    return None
+
+
+def build_reading_list_from_marvel_guide_url(seed_url: str) -> dict:
+    norm = _marvel_normalize_url(seed_url)
+    if not _is_marvel_guide_url(norm):
+        raise ValueError("Not a Marvel.com comics reading guide URL (expect …/comics/guides/…).")
+    html = _marvel_fetch_html(norm)
+    page_title = _cbro_page_title(html)
+    matches = _MARVEL_GUIDE_CARD_TITLE_RE.findall(html)
+    items: list[dict] = []
+    for _href, link_text in matches:
+        parsed = _parse_marvel_issue_card_title(link_text)
+        if parsed:
+            items.append(parsed)
+    if not items:
+        raise ValueError(
+            "That Marvel guide page loaded, but no issue links were recognized. "
+            "Try a full /comics/guides/… reading list URL."
+        )
+    dedupe_cbro_items_by_series_and_issue(items)
+    strip_first_appearance_notes_from_items(items)
+    apply_series_year_carry_forward(items)
+    _ensure_item_volume_key(items)
+    note = (
+        f"Imported from {norm} ({page_title}). "
+        f"{len(items)} issues in on-page reading order."
+    )
+    return {"description": note, "items": items, "_marvel_source": norm}
+
+
 class AIListGeneratorThread(QThread):
     list_ready = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
@@ -1510,6 +1621,22 @@ class AIListGeneratorThread(QThread):
                 return
             except Exception as e:
                 self.error_signal.emit(f"ComicBookReadingOrders import failed: {e}")
+                return
+
+        if seed and _is_marvel_guide_url(seed):
+            try:
+                data = build_reading_list_from_marvel_guide_url(seed)
+                if not data.get("items"):
+                    self.error_signal.emit(
+                        "That Marvel guide loaded, but no issues were recognized."
+                    )
+                    return
+                self.list_ready.emit(
+                    {"description": data["description"], "items": data["items"]}
+                )
+                return
+            except Exception as e:
+                self.error_signal.emit(f"Marvel.com guide import failed: {e}")
                 return
 
         if not GEMINI_KEY:

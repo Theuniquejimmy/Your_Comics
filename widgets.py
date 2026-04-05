@@ -6,12 +6,20 @@ import zipfile
 import xml.etree.ElementTree as ET
 
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QLabel,
-    QListWidget, QListWidgetItem, QVBoxLayout,
+    QAbstractItemView,
+    QApplication,
+    QDialog,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QVBoxLayout,
+    QWidget,
 )
 from PyQt6.QtCore import Qt, QTimer, QUrl, QMimeData, pyqtSignal
+from PyQt6.QtGui import QIcon
 
-from config import log
+from config import APP_ICON_PATH, log
 from utils import parse_comic_filename, natural_sort_key
 
 try:
@@ -19,6 +27,40 @@ try:
     HAS_RAR = True
 except ImportError:
     HAS_RAR = False
+
+
+def _mime_local_comic_paths(mime: QMimeData) -> list:
+    """Resolve .cbz/.cbr paths from Explorer / other apps (urls + text/uri-list fallback)."""
+    out = []
+    seen = set()
+    if mime.hasUrls():
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            p = os.path.normpath(url.toLocalFile())
+            low = p.lower()
+            if low.endswith((".cbz", ".cbr")) and os.path.isfile(p) and p not in seen:
+                seen.add(p)
+                out.append(p)
+    if out:
+        return out
+    if mime.hasFormat("text/uri-list"):
+        try:
+            raw = bytes(mime.data("text/uri-list")).decode("utf-8", errors="ignore")
+        except Exception:
+            raw = ""
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            u = QUrl(line)
+            if u.isLocalFile():
+                p = os.path.normpath(u.toLocalFile())
+                low = p.lower()
+                if low.endswith((".cbz", ".cbr")) and os.path.isfile(p) and p not in seen:
+                    seen.add(p)
+                    out.append(p)
+    return out
 
 
 class ClickableLabel(QLabel):
@@ -109,6 +151,78 @@ class DraggableSearchList(QListWidget):
         return mime
 
 
+class DraggableFolderComicList(QListWidget):
+    """Lists comic files in a folder; drag onto CBL grid tiles to link (file URLs in mime data)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setAlternatingRowColors(False)
+        self.setStyleSheet(
+            "background-color: #21222c; border: 1px solid #44475a; color: #f8f8f2; "
+            "font-size: 13px; padding: 4px;"
+        )
+
+    def mimeData(self, items):
+        mime = QMimeData()
+        urls = []
+        for item in items:
+            path = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(path, str) and path.lower().endswith((".cbz", ".cbr")):
+                urls.append(QUrl.fromLocalFile(path))
+        mime.setUrls(urls)
+        return mime
+
+
+class FolderComicsWindow(QMainWindow):
+    """Secondary window: all .cbz/.cbr under a folder for dragging onto the CBL grid."""
+
+    def __init__(self, folder_path: str, parent=None):
+        super().__init__(parent)
+        folder_path = os.path.normpath(folder_path)
+        self.setWindowTitle(f"Folder comics — {os.path.basename(folder_path) or folder_path}")
+        if os.path.isfile(APP_ICON_PATH):
+            self.setWindowIcon(QIcon(APP_ICON_PATH))
+        self.resize(560, 640)
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        hint = QLabel(
+            "Drag one or more files onto a tile in the main window’s reading list grid to link or replace.\n"
+            f"Folder:\n{folder_path}"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6272a4; padding: 4px;")
+        layout.addWidget(hint)
+        self.file_list = DraggableFolderComicList()
+        layout.addWidget(self.file_list, 1)
+        comics = []
+        try:
+            for root, _, files in os.walk(folder_path):
+                for f in files:
+                    if f.lower().endswith((".cbz", ".cbr")):
+                        comics.append(os.path.normpath(os.path.join(root, f)))
+        except OSError as e:
+            log.warning("FolderComicsWindow scan failed: %s", e)
+        comics.sort(key=natural_sort_key)
+        for p in comics:
+            try:
+                rel = os.path.relpath(p, folder_path)
+            except ValueError:
+                rel = os.path.basename(p)
+            it = QListWidgetItem(rel)
+            it.setToolTip(p)
+            it.setData(Qt.ItemDataRole.UserRole, p)
+            self.file_list.addItem(it)
+        if not comics:
+            ph = QListWidgetItem("(No .cbz / .cbr files in this folder)")
+            ph.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.file_list.addItem(ph)
+
+
 class HoverSummaryList(QListWidget):
     """QListWidget that shows a comic summary popup after hovering for 2.5 seconds."""
 
@@ -158,7 +272,7 @@ class HoverSummaryList(QListWidget):
         except RuntimeError:
             self._hovered_item = None
             return
-        if not user_str or user_str.startswith("MISSING:"):
+        if not user_str or user_str.startswith("MISSING:") or user_str.startswith("NOTE:"):
             return
 
         if user_str.startswith("FOLDER:"):
@@ -246,3 +360,60 @@ class HoverSummaryList(QListWidget):
         popup.move(px, py)
         popup.show()
         self._popup = popup
+
+
+class CblGridList(HoverSummaryList):
+    """CBL grid: drop .cbz/.cbr onto a tile (folder comic list window or Explorer)."""
+
+    comic_file_dropped = pyqtSignal(str, object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # QAbstractItemView defaults to NoDragDrop, which blocks external file drops.
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+
+    def _cbl_drop_allowed(self) -> bool:
+        win = self.window()
+        fn = getattr(win, "_cbl_grid_accepts_manual_links", None)
+        return callable(fn) and fn()
+
+    def dragEnterEvent(self, event):
+        if not self._cbl_drop_allowed():
+            event.ignore()
+            return
+        if _mime_local_comic_paths(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dragMoveEvent(self, event):
+        if not self._cbl_drop_allowed():
+            event.ignore()
+            return
+        if _mime_local_comic_paths(event.mimeData()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
+        event.ignore()
+
+    def dropEvent(self, event):
+        if not self._cbl_drop_allowed():
+            event.ignore()
+            return
+        paths = _mime_local_comic_paths(event.mimeData())
+        if not paths:
+            event.ignore()
+            return
+        pos = event.position().toPoint()
+        pt = self.viewport().mapFrom(self, pos)
+        item = self.itemAt(pt)
+        if item is None:
+            event.ignore()
+            return
+        self.comic_file_dropped.emit(paths[0], item)
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()

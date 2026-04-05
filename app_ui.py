@@ -9,7 +9,6 @@ import datetime
 import subprocess
 import hashlib
 import requests
-import tempfile
 import urllib.parse
 import zipfile
 import shutil
@@ -26,6 +25,7 @@ except ImportError:
 import config
 from config import (
     APP_SETTINGS,
+    APP_ICON_PATH,
     COMIC_VINE_KEY,
     GEMINI_KEY,
     CACHE_DIR,
@@ -72,9 +72,10 @@ from workers import (
 )
 from widgets import (
     ClickableLabel,
+    CblGridList,
+    FolderComicsWindow,
     ReadingDropListWidget,
     DraggableSearchList,
-    HoverSummaryList,
 )
 
 
@@ -123,17 +124,20 @@ from PyQt6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
     QSplitter,
+    QStyledItemDelegate,
     QTabWidget,
     QTextBrowser,
     QTextEdit,
     QTreeView,
     QVBoxLayout,
     QWidget,
+    QFrame,
 )
 from PyQt6.QtGui import (
     QColor,
@@ -143,6 +147,7 @@ from PyQt6.QtGui import (
     QImage,
     QKeySequence,
     QPainter,
+    QPen,
     QPixmap,
     QShortcut,
 )
@@ -162,6 +167,386 @@ from PyQt6.QtCore import (
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEnginePage, QWebEngineProfile, QWebEngineDownloadRequest
+
+
+# ==============================================================================
+# LOCAL GRID — CBL “non-digital” highlight (red tile border)
+# ==============================================================================
+class CblNonDigitalBorderDelegate(QStyledItemDelegate):
+    """Red border around CBL grid tiles whose path has no whole-word 'digital'."""
+
+    BORDER_ROLE = Qt.ItemDataRole.UserRole + 20
+
+    def paint(self, painter, option, index):  # noqa: N802 (Qt API)
+        super().paint(painter, option, index)
+        if not index.data(self.BORDER_ROLE):
+            return
+        painter.save()
+        pen = QPen(QColor("#ff5555"))
+        pen.setWidth(3)
+        pen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(option.rect.adjusted(2, 2, -2, -2))
+        painter.restore()
+
+
+_CBL_DIGITAL_WORD = re.compile(r"\bdigital\b", re.I)
+
+
+def _cbl_word_digital_in_path(path: str) -> bool:
+    if not path or not isinstance(path, str):
+        return False
+    return bool(_CBL_DIGITAL_WORD.search(path))
+
+
+# Strip "158 Title.cbz" reading-list indices (digits + space). Avoids 100–109 so "100 Bullets" stays intact.
+_CBL_READING_ORDER_INDEX_PREFIX = re.compile(r"^(?:1[1-9]\d|[2-9]\d{2}|[1-9]\d{3})\s+")
+
+
+def _cbl_strip_leading_reading_order_index(s: str) -> str:
+    return _CBL_READING_ORDER_INDEX_PREFIX.sub("", s)
+
+
+def _cbl_book_is_reading_order_note(c_series: str, c_num_raw: str) -> bool:
+    """True if this <Book> looks like a reading-order note, not a single issue."""
+    s = (c_series or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if len(s) > 130:
+        return True
+    markers = (
+        "retitled",
+        "the series was",
+        "series was retitled",
+        "was retitled",
+        "reading order note",
+        "starting with issue",
+        "continued in volume",
+        "continued as",
+        "see also:",
+        "editor's note",
+        "editorial note",
+    )
+    if any(m in low for m in markers):
+        return True
+    if len(s) > 75 and "#" not in s:
+        if " after " in low or "following" in low or " renamed " in low:
+            return True
+    return False
+
+
+# ==============================================================================
+# CBL MATCH FINDER (library tree + full reading list with per-row drops)
+# ==============================================================================
+class MatchFinderCblList(QListWidget):
+    """Reading list rows: each row accepts .cbz/.cbr drops from the library tree."""
+
+    def __init__(self, dialog, browser, parent=None):
+        super().__init__(parent)
+        self._dialog = dialog
+        self._browser = browser
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.setDefaultDropAction(Qt.DropAction.CopyAction)
+        self.setAlternatingRowColors(False)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+        else:
+            super().dragMoveEvent(event)
+
+    def dropEvent(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        pos = event.position().toPoint()
+        vp = self.viewport()
+        if vp:
+            pos = vp.mapFrom(self, pos)
+        it = self.itemAt(pos)
+        if it is None:
+            event.ignore()
+            return
+        row = it.data(Qt.ItemDataRole.UserRole)
+        if row is None or not isinstance(row, int) or row < 0:
+            event.ignore()
+            return
+        if self._dialog._row_is_note(row):
+            event.ignore()
+            return
+        path = None
+        for u in event.mimeData().urls():
+            p = u.toLocalFile()
+            if p.lower().endswith((".cbz", ".cbr")) and os.path.isfile(p):
+                path = os.path.normpath(p)
+                break
+        if not path:
+            event.ignore()
+            return
+        grid_item = self._browser.grid_list.item(row)
+        if not grid_item:
+            event.ignore()
+            return
+        self._browser.on_cbl_grid_file_dropped(path, grid_item)
+        self._dialog.refresh_rows_from_cache()
+        event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
+
+
+class CblMatchFinderDialog(QDialog):
+    """Library tree on the left; full CBL on the right with one drop target per row."""
+
+    def __init__(self, browser, parent=None, scroll_to_row=None):
+        super().__init__(parent or browser)
+        self._browser = browser
+        cbl_name = (
+            os.path.basename(browser.current_cbl_path)
+            if getattr(browser, "current_cbl_path", None)
+            else "Reading list"
+        )
+        self.setWindowTitle(f"Match finder — {cbl_name}")
+        self.resize(920, 620)
+        self.setModal(True)
+        self.setStyleSheet(
+            """
+            QDialog { background-color: #282a36; color: #f8f8f2; }
+            QLabel { color: #f8f8f2; }
+            QComboBox {
+                background-color: #21222c; color: #f8f8f2;
+                border: 1px solid #44475a; padding: 6px; border-radius: 4px;
+            }
+            QTreeView {
+                background-color: #21222c; color: #f8f8f2;
+                border: 1px solid #44475a; border-radius: 4px;
+                alternate-background-color: #21222c;
+            }
+            QTreeView::item { padding: 4px; }
+            QTreeView::item:selected { background-color: #44475a; color: #f8f8f2; }
+            QTreeView::item:hover { background-color: #383a4a; }
+            QListWidget {
+                background-color: #21222c; color: #f8f8f2;
+                border: 1px solid #44475a; border-radius: 4px;
+                font-size: 13px; padding: 4px;
+            }
+            QListWidget::item { padding: 8px; border-bottom: 1px solid #383a4a; }
+            QListWidget::item:selected { background-color: #44475a; color: #f8f8f2; }
+            QPushButton {
+                background-color: #44475a; color: #f8f8f2;
+                padding: 8px 16px; border: 1px solid #6272a4; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #6272a4; }
+            """
+        )
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget()
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(0, 0, 8, 0)
+        lv.addWidget(QLabel("Library"))
+        self.lib_combo = QComboBox()
+        lib_paths = []
+        for i in range(browser.lib_list.count()):
+            lib_paths.append(browser.lib_list.item(i).text())
+        for p in lib_paths:
+            label = os.path.basename(os.path.normpath(p)) or p
+            self.lib_combo.addItem(f"📁 {label}", p)
+        self.fs = QFileSystemModel()
+        self.fs.setRootPath(QDir.rootPath())
+        self.fs.setNameFilters(["*.cbz", "*.cbr"])
+        self.fs.setNameFilterDisables(False)
+        self.tree = QTreeView()
+        self.tree.setModel(self.fs)
+        self.tree.setAlternatingRowColors(False)
+        self.tree.setDragEnabled(True)
+        self.tree.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.tree.setDefaultDropAction(Qt.DropAction.CopyAction)
+        for col in (1, 2, 3):
+            self.tree.setColumnHidden(col, True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.tree.doubleClicked.connect(self._on_tree_double_clicked)
+        self.lib_combo.currentIndexChanged.connect(self._on_library_changed)
+        lv.addWidget(self.lib_combo)
+        lv.addWidget(self.tree, 1)
+        splitter.addWidget(left)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(8, 0, 0, 0)
+        rv.addWidget(QLabel("Reading list — drag files onto a row"))
+        hint = QLabel(
+            "Each row is one CBL entry. Drag .cbz / .cbr from the tree onto the row to link. "
+            "❌ = missing file; ⚠ = owned but filename has no whole-word \"digital\" (same red border as the grid)."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #6272a4; font-size: 12px;")
+        rv.addWidget(hint)
+        self.cbl_list = MatchFinderCblList(self, browser)
+        self.cbl_list.setWordWrap(True)
+        self.cbl_list.setSpacing(2)
+        rv.addWidget(self.cbl_list, 1)
+        browse_btn = QPushButton("Browse for comic (selected row)…")
+        browse_btn.clicked.connect(self._browse_for_selected_row)
+        rv.addWidget(browse_btn)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.reject)
+        rv.addWidget(close_btn)
+        splitter.addWidget(right)
+        splitter.setSizes([440, 480])
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(splitter)
+
+        if lib_paths:
+            self.lib_combo.setCurrentIndex(0)
+            self._set_tree_root(lib_paths[0])
+        else:
+            self.tree.setEnabled(False)
+            empty = QLabel("Add library folders in the main window (left list) first.")
+            empty.setStyleSheet("color: #ff5555;")
+            lv.insertWidget(1, empty)
+
+        self.refresh_rows_from_cache()
+        if scroll_to_row is not None and isinstance(scroll_to_row, int):
+            if 0 <= scroll_to_row < self.cbl_list.count():
+                sc_it = self.cbl_list.item(scroll_to_row)
+                self.cbl_list.setCurrentItem(sc_it)
+                self.cbl_list.scrollToItem(sc_it)
+
+    def _load_matches_from_disk(self):
+        cache_file = "cbl_match_cache.json"
+        cbl_path = getattr(self._browser, "current_cbl_path", None)
+        if not cbl_path or not os.path.isfile(cache_file):
+            return []
+        try:
+            with open(cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return []
+        return data.get(cbl_path, {}).get("matches", [])
+
+    def _row_is_note(self, row: int) -> bool:
+        git = self._browser.grid_list.item(row)
+        if not git:
+            return True
+        u = str(git.data(Qt.ItemDataRole.UserRole) or "")
+        if u.startswith("NOTE:"):
+            return True
+        m = self._load_matches_from_disk()
+        if row < len(m) and m[row].get("is_note"):
+            return True
+        return False
+
+    def refresh_rows_from_cache(self):
+        self.cbl_list.clear()
+        matches = self._load_matches_from_disk()
+        gl = self._browser.grid_list
+        for row in range(gl.count()):
+            git = gl.item(row)
+            title = self._browser._grid_item_copy_name_for_clipboard(git)
+            u = str(git.data(Qt.ItemDataRole.UserRole) or "")
+            m = matches[row] if row < len(matches) else {}
+
+            lines = [title, ""]
+            fg = QColor("#f8f8f2")
+
+            if m.get("is_note") or u.startswith("NOTE:"):
+                lines.append("📌 Note (reading order) — not linkable")
+                fg = QColor("#bd93f9")
+            elif u.startswith("MISSING:"):
+                lines.append("❌ Missing — drop a .cbz/.cbr here to link")
+                fg = QColor("#ff5555")
+            else:
+                p = os.path.normpath(u) if u and not u.startswith(("FOLDER:", "CBL:")) else ""
+                if p and os.path.isfile(p):
+                    base = os.path.basename(p)
+                    if not _cbl_word_digital_in_path(p):
+                        lines.append('⚠ Non-digital (no whole-word "digital" in path)')
+                        lines.append(f"✅ {base}")
+                        fg = QColor("#ffb86c")
+                    else:
+                        lines.append(f"✅ Owned — {base}")
+                        fg = QColor("#50fa7b")
+                else:
+                    lines.append("❌ Missing or invalid path — drop a file to link")
+                    fg = QColor("#ff5555")
+
+            text = "\n".join(lines)
+            lw_item = QListWidgetItem(text)
+            lw_item.setData(Qt.ItemDataRole.UserRole, row)
+            lw_item.setForeground(fg)
+            self.cbl_list.addItem(lw_item)
+
+    def _set_tree_root(self, folder: str):
+        folder = os.path.normpath(folder)
+        if os.path.isdir(folder):
+            idx = self.fs.index(folder)
+            self.tree.setRootIndex(idx)
+
+    def _on_library_changed(self, _index: int):
+        p = self.lib_combo.currentData()
+        if p and os.path.isdir(p):
+            self._set_tree_root(p)
+
+    def _on_tree_double_clicked(self, index):
+        path = self.fs.filePath(index)
+        if not (os.path.isfile(path) and path.lower().endswith((".cbz", ".cbr"))):
+            return
+        it = self.cbl_list.currentItem()
+        if not it:
+            _themed_information(
+                self,
+                "Match finder",
+                "Select a row on the right, then double-click a file here or drag it onto that row.",
+            )
+            return
+        row = it.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, int) or self._row_is_note(row):
+            return
+        self._apply_path_to_row(os.path.normpath(path), row)
+
+    def _browse_for_selected_row(self):
+        it = self.cbl_list.currentItem()
+        if not it:
+            _themed_information(self, "Match finder", "Select a row in the list on the right first.")
+            return
+        row = it.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, int):
+            return
+        if self._row_is_note(row):
+            _themed_information(self, "Match finder", "Notes cannot be linked to a file.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select comic",
+            self.lib_combo.currentData() or "",
+            "Comic archives (*.cbz *.cbr)",
+        )
+        if path:
+            self._apply_path_to_row(os.path.normpath(path), row)
+
+    def _apply_path_to_row(self, path: str, row: int):
+        if not path or not os.path.isfile(path):
+            return
+        grid_item = self._browser.grid_list.item(row)
+        if not grid_item:
+            return
+        self._browser.on_cbl_grid_file_dropped(path, grid_item)
+        self.refresh_rows_from_cache()
+        if 0 <= row < self.cbl_list.count():
+            sc_it = self.cbl_list.item(row)
+            self.cbl_list.setCurrentItem(sc_it)
+            self.cbl_list.scrollToItem(sc_it)
 
 
 # ==============================================================================
@@ -501,7 +886,7 @@ class ListMakerTab(QWidget):
         ai_layout.addWidget(QLabel("🤖 Ask AI to make me a list:"))
         self.ai_input = QLineEdit()
         self.ai_input.setPlaceholderText(
-            "Topic, or paste a ComicBookReadingOrders URL (follows 'Read ... here' links into event lists)"
+            "Topic, ComicBookReadingOrders URL, or Marvel.com /comics/guides/… reading list URL"
         )
         self.ai_input.returnPressed.connect(self.generate_ai_list)
 
@@ -698,7 +1083,11 @@ class ListMakerTab(QWidget):
 
         self.ai_btn.setEnabled(False)
         ql = query.lower()
-        if ql.startswith(("http://", "https://")) and "comicbookreadingorders.com" in ql:
+        if ql.startswith(("http://", "https://")) and "marvel.com/comics/guides/" in ql:
+            self.status_label.setText("⏳ Fetching Marvel reading guide…")
+        elif "marvel.com/comics/guides/" in ql:
+            self.status_label.setText("⏳ Fetching Marvel reading guide…")
+        elif ql.startswith(("http://", "https://")) and "comicbookreadingorders.com" in ql:
             self.status_label.setText(
                 "⏳ Fetching ComicBookReadingOrders and inlining linked lists (can take a while)..."
             )
@@ -1426,34 +1815,31 @@ class ComicFinderTab(QWidget):
 
     def on_audio_ready(self, audio_data):
 
-        # Clear the "Generating" status so you know it finished!
-        self.status_label.setText("Audio Ready! Playing...")
+        self.status_label.setText("Audio ready — press ▶️ Play Audio to listen.")
 
-        # 1. Safely check if the player exists before trying to stop it
-        if hasattr(self, 'player') and self.player is not None:
+        if hasattr(self, "player") and self.player is not None:
             self.player.stop()
 
-        # 2. Save the raw audio bytes into a temporary MP3 file
-        temp_audio_path = os.path.join(tempfile.gettempdir(), "temp_comic_audio.mp3")
-        with open(temp_audio_path, 'wb') as f:
-            f.write(audio_data)
+        try:
+            with open(self.audio_temp_file, "wb") as f:
+                f.write(audio_data)
+        except OSError:
+            self.status_label.setText("Could not save narration audio.")
+            self.analyze_btn.setEnabled(True)
+            self.prev_btn.setEnabled(True)
+            self.next_btn.setEnabled(True)
+            return
 
-        # 3. Create the player and speaker (attached to 'self')
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
-        self.audio_output.setVolume(1.0) 
-        
-        # 4. Plug the speaker into the player
+        self.audio_output.setVolume(1.0)
         self.player.setAudioOutput(self.audio_output)
-        
-        # 5. Load the new temporary file and press play!
-        self.player.setSource(QUrl.fromLocalFile(temp_audio_path))
+        self.player.setSource(QUrl.fromLocalFile(self.audio_temp_file))
         self.player.mediaStatusChanged.connect(self.check_autoplay)
-        self.player.play()
-        
-        
-        # 6. Wake the buttons back up so you can actually click them!
-        self.pause_btn.setEnabled(True)
+
+        self.play_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.pause_btn.setText("⏸️ Pause")
         self.stop_btn.setEnabled(True)
         self.analyze_btn.setEnabled(True)
         self.prev_btn.setEnabled(True)
@@ -1605,11 +1991,11 @@ class ComicChatTab(QWidget):
         self.tts_status_label = QLabel("")
         self.tts_status_label.setStyleSheet("color: #f1fa8c; font-style: italic;")
         
-        self.tts_toggle_btn = QPushButton("🔊 Voice: ON")
-        self.tts_toggle_btn.setCheckable(True)
-        self.tts_toggle_btn.setChecked(True)
-        self.tts_toggle_btn.setFixedWidth(100)
-        self.tts_toggle_btn.clicked.connect(self.toggle_voice)
+        self.play_tts_btn = QPushButton("▶️ Play audio")
+        self.play_tts_btn.setFixedWidth(120)
+        self.play_tts_btn.setEnabled(False)
+        self.play_tts_btn.setToolTip("Plays the last generated speech for the AI reply (after it finishes generating).")
+        self.play_tts_btn.clicked.connect(self.play_chat_audio)
 
         self.pause_btn = QPushButton("⏸️ Pause")
         self.pause_btn.setFixedWidth(90)
@@ -1629,7 +2015,7 @@ class ComicChatTab(QWidget):
         header_layout.addWidget(self.header_label)
         header_layout.addStretch() 
         header_layout.addWidget(self.tts_status_label)
-        header_layout.addWidget(self.tts_toggle_btn)
+        header_layout.addWidget(self.play_tts_btn)
         header_layout.addWidget(self.pause_btn)
         header_layout.addWidget(self.stop_audio_btn)
         header_layout.addWidget(self.clear_btn)
@@ -1655,6 +2041,7 @@ class ComicChatTab(QWidget):
         self.history = []
         self.chat_thread = None
         self.tts_thread = None
+        self._chat_audio_ready = False
 
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -1662,29 +2049,57 @@ class ComicChatTab(QWidget):
         self.audio_output.setVolume(1.0)
         self.audio_temp_file = os.path.join(CACHE_DIR, "chat_audio.mp3")
 
-    def toggle_voice(self):
-        if self.tts_toggle_btn.isChecked():
-            self.tts_toggle_btn.setText("🔊 Voice: ON")
-        else:
-            self.tts_toggle_btn.setText("🔇 Voice: OFF")
-            self.stop_audio()
+    def play_chat_audio(self):
+        """Play TTS for the last reply (audio is generated automatically; does not auto-play)."""
+        if not self._chat_audio_ready or not os.path.isfile(self.audio_temp_file):
+            self.tts_status_label.setText("No audio ready yet.")
+            return
+        if hasattr(self, "player") and self.player is not None:
+            self.player.setSource(QUrl.fromLocalFile(self.audio_temp_file))
+            self.pause_btn.setEnabled(True)
+            self.stop_audio_btn.setEnabled(True)
+            self.player.play()
+            self.tts_status_label.setText("🔊 Playing…")
 
     def stop_audio(self):
         self.player.stop()
         self.stop_audio_btn.setEnabled(False)
         self.pause_btn.setEnabled(False)
         self.pause_btn.setText("⏸️ Pause")
-        self.tts_status_label.setText("")
+        if self._chat_audio_ready:
+            self.tts_status_label.setText("Audio ready — press Play to listen")
+        else:
+            self.tts_status_label.setText("")
 
     def update_context(self, title, summary):
         self.context_title = title
         self.context_summary = summary
         self.header_label.setText(f"Discussing: {title}")
 
+    def ask_whats_this_about(self, title: str, context_summary: str):
+        """Set chat context, clear prior turns, and ask for a detailed summary (grid / right-click)."""
+        self.update_context(title, context_summary or "")
+        self.history.clear()
+        self.chat_input.setText(
+            "Using the metadata above, write a long, in-depth answer. "
+            "Prioritize a LARGE plot summary: several full paragraphs describing what happens—setup, "
+            "main story beats, key scenes or twists, character arcs in this issue/volume, conflicts, "
+            "and how it ends or cliffhangers. Do not keep the plot section short. "
+            "After that, add sections for: main characters and roles, tone and themes, and how it fits "
+            "the wider series or run (if known). "
+            "If this is a reading list file, explain what the list covers and its purpose. "
+            "If it is a note or missing slot, explain what that entry represents. "
+            "Use clear headings or paragraphs so it is easy to read."
+        )
+        self.send_message()
+
     def clear_chat(self):
         self.history.clear()
         self.chat_display.clear()
         self.stop_audio()
+        self._chat_audio_ready = False
+        self.play_tts_btn.setEnabled(False)
+        self.tts_status_label.setText("")
 
     def send_message(self):   
         user_text = self.chat_input.text().strip()
@@ -1695,7 +2110,11 @@ class ComicChatTab(QWidget):
         self.append_chat_bubble("🦸 You", user_text, "#6272a4")
         
         self.send_btn.setEnabled(False)
-        
+        self._chat_audio_ready = False
+        self.play_tts_btn.setEnabled(False)
+        if hasattr(self, "player") and self.player is not None:
+            self.player.stop()
+
         self.chat_thread = GeminiChatThread(self.context_summary, self.history.copy(), user_text)
         self.chat_thread.response_ready.connect(self.on_response)
         self.chat_thread.error_occurred.connect(self.on_error)
@@ -1706,54 +2125,50 @@ class ComicChatTab(QWidget):
         self.append_chat_bubble("🤖 Interrogator", text, "#44475a")
         self.send_btn.setEnabled(True)
 
-        if self.tts_toggle_btn.isChecked():
-            self.tts_status_label.setText("🎙️ Generating audio...")
-            self.stop_audio_btn.setEnabled(True)
-            
-            # Map the text name from Settings to the actual Microsoft Voice ID
-            voice_map = {
-                "Jenny (Standard US Female)": "en-US-JennyNeural",
-                "Christopher (Deep US Male)": "en-US-ChristopherNeural", 
-                "Aria (Clear US Female)": "en-US-AriaNeural",
-                "Guy (Energetic US Male)": "en-US-GuyNeural",
-                "Steffan (Pro US Male)": "en-US-SteffanNeural",
-                "Ryan (British Male)": "en-GB-RyanNeural",
-                "Sonia (British Female)": "en-GB-SoniaNeural",
-                "Natasha (Australian Female)": "en-AU-NatashaNeural",
-                "William (Australian Male)": "en-AU-WilliamNeural"
-            }
-            chosen_voice = voice_map.get(APP_SETTINGS["chat_voice"], "en-US-JennyNeural")
-            
-            self.tts_thread = TTSWorkerThread(text, chosen_voice)
-            self.tts_thread.audio_ready.connect(self.on_audio_ready)
-            self.tts_thread.start()
+        self.tts_status_label.setText("🎙️ Generating audio…")
+        self.play_tts_btn.setEnabled(False)
+        self._chat_audio_ready = False
+
+        voice_map = {
+            "Jenny (Standard US Female)": "en-US-JennyNeural",
+            "Christopher (Deep US Male)": "en-US-ChristopherNeural",
+            "Aria (Clear US Female)": "en-US-AriaNeural",
+            "Guy (Energetic US Male)": "en-US-GuyNeural",
+            "Steffan (Pro US Male)": "en-US-SteffanNeural",
+            "Ryan (British Male)": "en-GB-RyanNeural",
+            "Sonia (British Female)": "en-GB-SoniaNeural",
+            "Natasha (Australian Female)": "en-AU-NatashaNeural",
+            "William (Australian Male)": "en-AU-WilliamNeural",
+        }
+        chosen_voice = voice_map.get(APP_SETTINGS["chat_voice"], "en-US-JennyNeural")
+
+        self.tts_thread = TTSWorkerThread(text, chosen_voice)
+        self.tts_thread.audio_ready.connect(self.on_audio_ready)
+        self.tts_thread.start()
 
     def on_audio_ready(self, audio_data):
 
-        # 1. Safely check if the player exists before trying to stop it
-        if hasattr(self, 'player') and self.player is not None:
+        if hasattr(self, "player") and self.player is not None:
             self.player.stop()
 
-        # 2. Save the raw bytes to a temporary chat audio file!
-        temp_audio_path = os.path.join(tempfile.gettempdir(), "temp_chat_audio.mp3")
-        with open(temp_audio_path, 'wb') as f:
-            f.write(audio_data)
+        try:
+            with open(self.audio_temp_file, "wb") as f:
+                f.write(audio_data)
+        except OSError:
+            self.tts_status_label.setText("Could not save audio file.")
+            self.play_tts_btn.setEnabled(False)
+            return
 
-        # 3. Create the player and speaker (attached to 'self')
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
-        self.audio_output.setVolume(1.0) 
-        
-        # 4. Plug the speaker into the player
+        self.audio_output.setVolume(1.0)
         self.player.setAudioOutput(self.audio_output)
-        
-        # 5. Load the new temporary file and press play!
-        self.player.setSource(QUrl.fromLocalFile(temp_audio_path))
-        self.player.play()
-        
-        # 6. NEW: Wake the buttons back up so you can actually click them!
-        if hasattr(self, 'pause_btn'): self.pause_btn.setEnabled(True)
-        if hasattr(self, 'stop_audio_btn'): self.stop_audio_btn.setEnabled(True)
+        self.player.setSource(QUrl.fromLocalFile(self.audio_temp_file))
+
+        self._chat_audio_ready = True
+        self.tts_status_label.setText("Audio ready — press Play to listen")
+        self.play_tts_btn.setEnabled(True)
+        self.stop_audio_btn.setEnabled(True)
 
     # ⬅️ Look at this alignment! It must line up perfectly with 'def on_audio_ready'
     def toggle_pause(self):
@@ -1767,6 +2182,9 @@ class ComicChatTab(QWidget):
     def on_error(self, err):
         self.append_chat_bubble("⚠️ Error", err, "#ff5555")
         self.send_btn.setEnabled(True)
+        self.tts_status_label.setText("")
+        self.play_tts_btn.setEnabled(False)
+        self._chat_audio_ready = False
 
     def append_chat_bubble(self, sender, text, color):
         html_content = f"""
@@ -4052,38 +4470,6 @@ class ComicMetadataDialog(QDialog):
 # COMIC BROWSER
 # ==============================================================================
 class ComicBrowser(QMainWindow):
-    def on_tree_right_click(self, position):
-        
-        index = self.tree.indexAt(position)
-        if not index.isValid():
-            return
-            
-        source_index = self.proxy_model.mapToSource(index)
-        path = self.model.filePath(source_index)
-        
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; } 
-            QMenu::item { padding: 5px 20px; }
-            QMenu::item:selected { background-color: #44475a; }
-        """)
-        
-        open_action = menu.addAction("📂 Open in File Explorer")
-        tagger_action = menu.addAction("🏷️ Send to Tagger")
-
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
-
-        if action == open_action:
-            folder = path if os.path.isdir(path) else os.path.dirname(path)
-            try:
-                os.startfile(folder)
-            except Exception as e:
-                print(f"Could not open folder: {e}")
-        elif action == tagger_action:
-            folder = path if os.path.isdir(path) else os.path.dirname(path)
-            self._ensure_tab_built(self._TAB_TAGGER)
-            self.tagger_tab.receive_folder(folder)
-            self.tabs.setCurrentIndex(self._TAB_TAGGER)
     def grid_go_up(self):
         if not getattr(self, 'current_grid_folder', None): return
         parent_dir = os.path.dirname(self.current_grid_folder)
@@ -4294,6 +4680,8 @@ class ComicBrowser(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Your Comics!")
+        if os.path.isfile(APP_ICON_PATH):
+            self.setWindowIcon(QIcon(APP_ICON_PATH))
         self.resize(1300, 850)
 
         self.hidden_file = "hidden_items.json"
@@ -4572,8 +4960,8 @@ class ComicBrowser(QMainWindow):
         self.copy_cbl_to_folder_btn.setStyleSheet("background-color: #8be9fd; color: #282a36; font-weight: bold; padding: 5px;")
         self.copy_cbl_to_folder_btn.clicked.connect(self.copy_cbl_grid_comics_to_folder)
         self.copy_cbl_to_folder_btn.setToolTip(
-            "Copy matched comics with zero-padded list order (001…), issue (#009), and volume (vol. 002) "
-            "so filenames sort in reading order."
+            "Copy matched comics and prefix only padded read order (01, 10, ...), "
+            "keeping the original comic filenames."
         )
         self.copy_cbl_to_folder_btn.hide()
 
@@ -4587,7 +4975,7 @@ class ComicBrowser(QMainWindow):
         self.grid_layout.addLayout(self.grid_top_layout)
 
         # 2. Create and add the grid list below it
-        self.grid_list = HoverSummaryList()
+        self.grid_list = CblGridList()
         self.grid_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.grid_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.grid_list.setMovement(QListWidget.Movement.Static)
@@ -4608,6 +4996,8 @@ class ComicBrowser(QMainWindow):
         self.grid_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.grid_list.customContextMenuRequested.connect(self.show_grid_context_menu)
         self.grid_layout.addWidget(self.grid_list)
+        self.grid_list.setItemDelegate(CblNonDigitalBorderDelegate(self.grid_list))
+        self.grid_list.comic_file_dropped.connect(self.on_cbl_grid_file_dropped)
 
         # Grid cover size slider
         grid_size_row = QHBoxLayout()
@@ -4668,6 +5058,10 @@ class ComicBrowser(QMainWindow):
             self.lib_list.setCurrentItem(first_item)
             self.on_library_clicked(first_item) # Simulates a user clicking it!
         # -----------------------------------------------
+
+        # Warm the web engine/GetComics tab shortly after launch so
+        # missing-comic links work immediately and first-open is faster.
+        QTimer.singleShot(1200, self._prewarm_getcomics_tab)
         
     # Tab index map (matches the addTab order above)
     _TAB_FINDER      = 2
@@ -4744,6 +5138,200 @@ class ComicBrowser(QMainWindow):
             self.tabs.insertTab(index, self.settings_tab, 'Settings')
             self.tabs.blockSignals(False)
             self.tabs.setCurrentIndex(index)
+
+    def _prewarm_getcomics_tab(self):
+        """Build GetComics in-place without switching away from the current tab."""
+        if self.getcomics_tab is not None:
+            return
+        current_idx = self.tabs.currentIndex()
+        self._ensure_tab_built(self._TAB_GETCOMICS)
+        self.tabs.setCurrentIndex(current_idx)
+
+    def _reading_list_meta(self, cbl_path: str):
+        """Display name from CBL XML if present, plus year from filename."""
+        name = os.path.basename(cbl_path)
+        year = self._cbl_year_from_path(cbl_path)
+        try:
+            root = ET.parse(cbl_path).getroot()
+            ne = root.find("Name")
+            if ne is not None and (ne.text or "").strip():
+                name = (ne.text or "").strip()
+        except Exception:
+            pass
+        return name, year
+
+    def _comicinfo_meta_from_cbz(self, path: str):
+        meta = {}
+        if not path.lower().endswith(".cbz"):
+            return meta
+        try:
+            with zipfile.ZipFile(path, "r") as zf:
+                if "ComicInfo.xml" not in zf.namelist():
+                    return meta
+                c_root = ET.fromstring(zf.read("ComicInfo.xml"))
+            for tag in ("Series", "Number", "Volume", "Year", "Title", "Publisher", "Summary"):
+                el = c_root.find(tag)
+                if el is not None and el.text and str(el.text).strip():
+                    meta[tag.lower()] = str(el.text).strip()
+        except Exception:
+            pass
+        return meta
+
+    def _build_whats_this_context_from_fs_path(self, path: str):
+        """Context for a filesystem path (left tree or file). Returns (title, summary) or None."""
+        path = os.path.normpath(path or "")
+        if not path or not os.path.exists(path):
+            return None
+        if os.path.isdir(path):
+            title = f"Folder: {os.path.basename(path)}"
+            ctx = f"Type: Library folder\nPath: {path}"
+            return title, ctx
+        low = path.lower()
+        if low.endswith(".cbl"):
+            list_name, list_year = self._reading_list_meta(path)
+            lines = [
+                "Type: Comic reading list file (.cbl)",
+                f"Reading list title: {list_name}",
+                f"Year from CBL filename (if present): {list_year or 'unknown'}",
+                f"File: {os.path.basename(path)}",
+            ]
+            try:
+                n_books = len(ET.parse(path).getroot().findall(".//Book"))
+                lines.append(f"Number of Book entries: {n_books}")
+            except Exception as e:
+                lines.append(f"(Could not count books: {e})")
+            title = f"Reading list: {list_name}"
+            return title, "\n".join(lines)
+        if low.endswith((".cbz", ".cbr")):
+            lines = [
+                "Type: Comic archive file",
+                f"File name: {os.path.basename(path)}",
+                f"Full path: {path}",
+            ]
+            ci = self._comicinfo_meta_from_cbz(path)
+            if ci:
+                lines.append("Metadata (ComicInfo.xml):")
+                for k in ("series", "title", "number", "volume", "year", "publisher", "summary"):
+                    if ci.get(k):
+                        lines.append(f"  {k}: {ci[k]}")
+            title = ci.get("series") or ci.get("title") or os.path.splitext(os.path.basename(path))[0]
+            return title, "\n".join(lines)
+        return None
+
+    def _build_whats_this_context(self, item):
+        """Return (title, context_summary) for Comic Chat, or None if not supported."""
+        user_str = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        display = self._grid_item_copy_name_for_clipboard(item)
+
+        if user_str.startswith("CBL:"):
+            return self._build_whats_this_context_from_fs_path(os.path.normpath(user_str[4:]))
+
+        if user_str.startswith("FOLDER:"):
+            return self._build_whats_this_context_from_fs_path(os.path.normpath(user_str[7:]))
+
+        cbl_open = (
+            getattr(self, "current_cbl_path", None)
+            and os.path.isfile(self.current_cbl_path)
+            and getattr(self, "refresh_cbl_btn", None)
+            and self.refresh_cbl_btn.isVisible()
+        )
+        if cbl_open:
+            cbl_path = self.current_cbl_path
+            row = self.grid_list.row(item)
+            list_name, list_year = self._reading_list_meta(cbl_path)
+            lines = [
+                "Type: Issue or note from an open reading list",
+                f"Parent reading list title: {list_name}",
+                f"Parent list year from filename: {list_year or 'unknown'}",
+                f"Parent CBL file: {os.path.basename(cbl_path)}",
+            ]
+            c_series = c_num_raw = c_year = c_vol = ""
+            try:
+                books = ET.parse(cbl_path).getroot().findall(".//Book")
+                if 0 <= row < len(books):
+                    bk = books[row]
+                    c_series = (bk.get("Series") or "").strip()
+                    c_num_raw = (bk.get("Number") or "").strip()
+                    c_year = (bk.get("Year") or "").strip() or list_year
+                    c_vol = (bk.get("Volume") or "").strip()
+                    lines.append("")
+                    lines.append("CBL Book metadata (XML):")
+                    lines.append(f"  Series: {c_series}")
+                    if c_vol:
+                        lines.append(f"  Volume: {c_vol}")
+                    lines.append(f"  Issue: {c_num_raw}")
+                    lines.append(f"  Year: {c_year}")
+            except Exception as e:
+                lines.append(f"(Could not read Book row from CBL: {e})")
+
+            lines.append("")
+            lines.append(f"Grid label: {display}")
+
+            if user_str.startswith("NOTE:"):
+                lines.append("Slot type: Reading-order note")
+                lines.append(f"Note payload: {user_str[:2000]}")
+            elif user_str.startswith("MISSING:"):
+                lines.append("Slot type: Missing (no file linked)")
+                lines.append(f"Missing search data: {user_str}")
+            elif user_str and not user_str.startswith(("FOLDER:", "CBL:")):
+                lp = os.path.normpath(user_str)
+                if os.path.isfile(lp):
+                    lines.append(f"Linked file name: {os.path.basename(lp)}")
+                    lines.append(f"Linked file path: {lp}")
+                    ci = self._comicinfo_meta_from_cbz(lp)
+                    if ci:
+                        lines.append("ComicInfo.xml (if present):")
+                        for k in ("series", "title", "number", "volume", "year", "publisher", "summary"):
+                            if ci.get(k):
+                                lines.append(f"  {k}: {ci[k]}")
+
+            slot_title = display
+            if c_series:
+                slot_title = c_series
+                if c_vol:
+                    slot_title += f" Vol {c_vol}"
+                if c_num_raw:
+                    slot_title += f" {c_num_raw}"
+                if c_year:
+                    slot_title += f" {c_year}"
+            return slot_title, "\n".join(lines)
+
+        if user_str.startswith("MISSING:") or user_str.startswith("NOTE:"):
+            return None
+
+        path = os.path.normpath(user_str) if user_str else ""
+        if path and os.path.isfile(path):
+            return self._build_whats_this_context_from_fs_path(path)
+
+        return None
+
+    def _send_whats_this_about_to_fs_path(self, path: str):
+        built = self._build_whats_this_context_from_fs_path(path)
+        if not built:
+            _themed_information(
+                self,
+                "What's this about?",
+                "No context could be built for this selection (.cbl, .cbz, .cbr, or folders only).",
+            )
+            return
+        title, ctx = built
+        self._ensure_tab_built(self._TAB_CHAT)
+        self.tabs.setCurrentIndex(self._TAB_CHAT)
+        self.chat_tab.ask_whats_this_about(title, ctx)
+
+    def _send_whats_this_about_to_chat(self, item):
+        built = self._build_whats_this_context(item)
+        if not built:
+            _themed_information(
+                self,
+                "What's this about?",
+                "No context could be built for this selection.",
+            )
+            return
+        title, ctx = built
+        self._ensure_tab_built(self._TAB_CHAT)
+        self.tabs.setCurrentIndex(self._TAB_CHAT)
+        self.chat_tab.ask_whats_this_about(title, ctx)
 
     def _open_url_in_getcomics(self, url: str):
         """Build the GetComics tab if needed, switch to it, and navigate to url."""
@@ -4945,7 +5533,7 @@ class ComicBrowser(QMainWindow):
         grid_paths = []
         for i in range(self.grid_list.count()):
             data = self.grid_list.item(i).data(Qt.ItemDataRole.UserRole)
-            if data and isinstance(data, str) and not data.startswith("FOLDER:") and not data.startswith("MISSING:"):
+            if data and isinstance(data, str) and not data.startswith("FOLDER:") and not data.startswith("MISSING:") and not data.startswith("NOTE:"):
                 grid_paths.append(os.path.normpath(data))
 
         if current_norm in grid_paths:
@@ -5394,21 +5982,26 @@ class ComicBrowser(QMainWindow):
                     self.tree.setExpanded(proxy_idx, True)
             return
 
+        # --- PHASE 1b: Reading-order note row (not a comic file) ---
+        if user_str.startswith("NOTE:"):
+            body = user_str[5:].strip() or "(empty note)"
+            _themed_information(self, "Reading order note", body[:4000])
+            return
+
         # --- PHASE 2: Check if it's a MISSING comic in a CBL! ---
         if user_str.startswith("MISSING:"):
             raw_query = user_str.split("MISSING:")[1]
             
             # THE FIX: Safely chop off the year (e.g., "1999" or "2015") if it is at the end of the string!
             search_query = re.sub(r'\s+(19|20)\d{2}$', '', raw_query).strip()
-            
-            getcomics_idx = self.tabs.indexOf(self.getcomics_tab)
-            if getcomics_idx != -1:
-                self.tabs.setCurrentIndex(getcomics_idx)
-                
+
+            # Ensure tab exists even if user has never opened GetComics manually.
+            self._ensure_tab_built(self._TAB_GETCOMICS)
+            if self.getcomics_tab is not None:
+                self.tabs.setCurrentWidget(self.getcomics_tab)
                 safe_query = urllib.parse.quote_plus(search_query)
                 search_url = f"https://getcomics.org/?s={safe_query}"
-                
-                self._ensure_tab_built(self._TAB_GETCOMICS)
+                self.getcomics_tab.set_origin_article_url(search_url)
                 self.getcomics_tab.url_bar.setText(search_url)
                 self.getcomics_tab.load_url()
             return
@@ -5609,17 +6202,15 @@ class ComicBrowser(QMainWindow):
             )
             return
 
-        books_list = self._cbl_all_books_from_path(self.current_cbl_path)
-
         n = self.grid_list.count()
-        slot_width = max(3, len(str(n)))
+        slot_width = max(2, len(str(n)))
         entries = []
         for row in range(n):
             it = self.grid_list.item(row)
             data = it.data(Qt.ItemDataRole.UserRole)
             if not isinstance(data, str) or not data:
                 continue
-            if data.startswith("MISSING:"):
+            if data.startswith("MISSING:") or data.startswith("NOTE:"):
                 continue
             src = os.path.normpath(data)
             if not os.path.isfile(src):
@@ -5652,17 +6243,11 @@ class ComicBrowser(QMainWindow):
 
         copied = 0
         errors = []
-        for slot, row_idx, src, label in entries:
+        for slot, _row_idx, src, _label in entries:
             ext = os.path.splitext(src)[1].lower()
             if not ext:
                 ext = ".cbz"
-            fb = os.path.splitext(os.path.basename(src))[0]
-            book = books_list[row_idx] if row_idx < len(books_list) else None
-            if book is not None and self._cbl_book_field(book, "Series"):
-                stem = self._reading_order_copy_stem_from_cbl_book(book)
-            else:
-                stem = self._sanitize_reading_order_copy_stem(label, fb)
-                stem = self._pad_issue_numbers_in_copy_filename_stem(stem)
+            stem = os.path.splitext(os.path.basename(src))[0]
             slot_padded = format(slot, f"0{slot_width}d")
             base = f"{slot_padded} {stem}"
             out_name = base + ext
@@ -5685,6 +6270,36 @@ class ComicBrowser(QMainWindow):
             if len(errors) > 5:
                 msg += f"\n… and {len(errors) - 5} more."
         QMessageBox.information(self, "Copy complete", msg)
+
+    def _merge_manual_cbl_matches(self, matches_to_draw, prior_matches):
+        """After a forced rescan, restore manually linked paths so Refresh does not wipe them."""
+        if not prior_matches or not matches_to_draw:
+            return
+        by_sq = {}
+        for pm in prior_matches:
+            sq = pm.get("search_query")
+            if sq:
+                by_sq[sq] = pm
+        for m in matches_to_draw:
+            sq = m.get("search_query")
+            if not sq:
+                continue
+            pm = by_sq.get(sq)
+            if not pm:
+                continue
+            old_path = (pm.get("path") or "").strip()
+            if not old_path:
+                continue
+            old_path = os.path.normpath(old_path)
+            if not os.path.exists(old_path):
+                continue
+            new_path = (m.get("path") or "").strip()
+            new_ok = bool(new_path and os.path.exists(os.path.normpath(new_path)))
+            if pm.get("manual_link"):
+                m["path"] = old_path
+                m["manual_link"] = True
+            elif not new_ok:
+                m["path"] = old_path
 
     def load_cbl_grid(self, cbl_path, force_refresh=False):
         self.grid_list.clear()
@@ -5723,6 +6338,9 @@ class ComicBrowser(QMainWindow):
                     log.warning("Suppressed exception: %s", _e)
             cbl_mtime = os.path.getmtime(cbl_path) if os.path.exists(cbl_path) else 0
             matches_to_draw = []
+            prior_matches_for_manual_merge = None
+            if force_refresh and cbl_path in cache_data:
+                prior_matches_for_manual_merge = cache_data[cbl_path].get("matches")
 
             if not force_refresh and cbl_path in cache_data and cache_data[cbl_path].get('mtime') == cbl_mtime:
                 print("⚡ Loading CBL from Lightning Cache!")
@@ -5760,6 +6378,8 @@ class ComicBrowser(QMainWindow):
                                 
                                 # Strip reading order prefixes (e.g. "002 ", "15. ", "07 - ")
                                 pre_clean = re.sub(r'^(?:0\d{1,3}[\.\-]?|\d{1,4}[\.\-])\s+', '', pre_clean)
+                                # "158 Ms. Marvel…" (digits + space only; see _cbl_strip_leading_reading_order_index)
+                                pre_clean = _cbl_strip_leading_reading_order_index(pre_clean)
                                 
                                 # --- 3. CATCH HIDDEN ISSUES ---
                                 # Finds issue numbers hidden inside parentheses before we delete them! (e.g. "(_02)" or "(#01)" or "( 07)")
@@ -5846,7 +6466,8 @@ class ComicBrowser(QMainWindow):
                                     t = str(text).lower().replace('&', 'and')
                                     t = t.replace('_', ' ') # THE UNDERSCORE FIX: Prevents words from mashing together!
                                     t = t.replace("'", "").replace("’", "")
-                                    t = t.replace("maxx", "max") 
+                                    t = t.replace("maxx", "max")
+                                    t = re.sub(r"\bmister\b", "mr", t)
                                     
                                     # THE 2099 FIX: Only strip years explicitly inside parentheses
                                     t = re.sub(r'\(\s*(19|20)\d{2}\s*\)', '', t) 
@@ -5855,6 +6476,7 @@ class ComicBrowser(QMainWindow):
                                     # (Safely ignores actual titles like "100 Bullets" because they have no dot/dash)
                                     t = re.sub(r'^\d+[\.\-]\s*', '', t)
                                     t = re.sub(r'^0\d*\s+', '', t) # Strips raw numbers if they start with a 0 (e.g. "07 ")
+                                    t = _cbl_strip_leading_reading_order_index(t)
                                     
                                     t = re.sub(r'[-–—:()\[\]]', ' ', t) 
                                     t = re.sub(r'[^a-z0-9\s]', '', t)
@@ -5897,6 +6519,23 @@ class ComicBrowser(QMainWindow):
                         display_name += f" #{display_num}"
                     if c_year:
                         display_name += f"\n({c_year})"
+
+                    if _cbl_book_is_reading_order_note(c_series, c_num_raw):
+                        short = c_series.strip().replace("\n", " ")
+                        if len(short) > 90:
+                            short = short[:87].rstrip() + "…"
+                        note_display = short
+                        if c_year:
+                            note_display += f"\n({c_year})"
+                        matches_to_draw.append(
+                            {
+                                "display_name": note_display,
+                                "path": "",
+                                "search_query": "NOTE:" + (c_series[:2000] if c_series else ""),
+                                "is_note": True,
+                            }
+                        )
+                        continue
 
                     c_clean = clean_for_match(c_series)
                     c_core = get_core_title(c_clean)
@@ -5999,21 +6638,44 @@ class ComicBrowser(QMainWindow):
                                         is_match, score = True, int(ratio * 100)
 
                         if is_match:
+                            strong_title = (c_core == f_core) or (
+                                c_core_flat
+                                and f_core_flat
+                                and c_core_flat == f_core_flat
+                            ) or (score >= 90)
                             if c_nv and f_nv and c_nv == f_nv:
                                 score += 14
                             if c_year and comic['year']:
                                 try:
                                     y_diff = abs(int(c_year) - int(comic['year']))
-                                    if y_diff == 0: score += 20
-                                    elif y_diff <= 1: score += 10
-                                    elif y_diff > 2: 
-                                        is_any_coll = (c_is_epic or f_is_epic or c_is_mw or f_is_mw or c_is_omni or f_is_omni or c_is_comp or f_is_comp or c_is_tpb or f_is_tpb or "collection" in c_clean or "collection" in f_clean)
-                                        if not is_any_coll:
-                                            if not (c_nv and f_nv and c_nv == f_nv):
-                                                # --- DOUBLE SHIELD 2: THE LETHAL YEAR PENALTY ---
-                                                # Drops a 100% match to a 30% score (Instant Fail)
-                                                score -= 70 
-                                except ValueError: pass
+                                    if y_diff == 0:
+                                        score += 20
+                                    elif y_diff <= 1:
+                                        score += 10
+                                    elif y_diff > 2:
+                                        is_any_coll = (
+                                            c_is_epic
+                                            or f_is_epic
+                                            or c_is_mw
+                                            or f_is_mw
+                                            or c_is_omni
+                                            or f_is_omni
+                                            or c_is_comp
+                                            or f_is_comp
+                                            or c_is_tpb
+                                            or f_is_tpb
+                                            or "collection" in c_clean
+                                            or "collection" in f_clean
+                                        )
+                                        if (
+                                            not strong_title
+                                            and not is_any_coll
+                                            and not (c_nv and f_nv and c_nv == f_nv)
+                                        ):
+                                            # Lethal year penalty — skipped when title core already matches
+                                            score -= 70
+                                except ValueError:
+                                    pass
                             elif (not c_year) and c_nv and f_nv and c_nv == f_nv:
                                 score += 12
                                 
@@ -6035,6 +6697,9 @@ class ComicBrowser(QMainWindow):
                         "search_query": search_query
                     })
 
+                if prior_matches_for_manual_merge:
+                    self._merge_manual_cbl_matches(matches_to_draw, prior_matches_for_manual_merge)
+
                 cache_data[cbl_path] = {'mtime': cbl_mtime, 'matches': matches_to_draw}
                 try:
                     with open(cache_file, 'w') as f: json.dump(cache_data, f)
@@ -6046,59 +6711,93 @@ class ComicBrowser(QMainWindow):
             owned_files_to_load = []
             owned_count = 0
             missing_count = 0
-            
+            note_count = 0
+
             for match in matches_to_draw:
                 safe_path = match["path"]
                 display_name = match["display_name"]
-                
+
+                if match.get("is_note"):
+                    note_count += 1
+                    item = QListWidgetItem(display_name)
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                    pixmap = QPixmap(180, 270)
+                    pixmap.fill(QColor("#21222c"))
+                    painter = QPainter(pixmap)
+                    painter.setPen(QColor("#bd93f9"))
+                    painter.drawText(
+                        pixmap.rect(),
+                        Qt.AlignmentFlag.AlignCenter,
+                        "📌 Note\n\n(reading order)",
+                    )
+                    painter.end()
+                    item.setIcon(QIcon(pixmap))
+                    item.setForeground(QColor("#bd93f9"))
+                    item.setData(Qt.ItemDataRole.UserRole, match.get("search_query", "NOTE:"))
+                    self.grid_list.addItem(item)
+                    continue
+
                 if safe_path and os.path.exists(safe_path):
                     owned_count += 1
                     safe_path = os.path.normpath(safe_path)
-                    
-                    if safe_path in getattr(self, 'reading_history', set()):
+
+                    if safe_path in getattr(self, "reading_history", set()):
                         display_name = "✅ " + display_name
 
                     item = QListWidgetItem(display_name)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                     item.setData(Qt.ItemDataRole.UserRole, safe_path)
-                    
+
                     pixmap = QPixmap(180, 270)
-                    pixmap.fill(QColor("#21222c")) 
+                    pixmap.fill(QColor("#21222c"))
                     painter = QPainter(pixmap)
-                    painter.setPen(QColor("#50fa7b")) 
+                    painter.setPen(QColor("#50fa7b"))
                     painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "⏳ Loading...")
                     painter.end()
-                    
+
                     item.setIcon(QIcon(pixmap))
-                    item.setForeground(QColor("#50fa7b")) 
-                    
+                    item.setForeground(QColor("#50fa7b"))
+                    if not _cbl_word_digital_in_path(safe_path):
+                        item.setData(CblNonDigitalBorderDelegate.BORDER_ROLE, True)
+
                     owned_files_to_load.append(safe_path)
                     self.grid_list.addItem(item)
-                    
+
                     if safe_path not in self.grid_items_map:
                         self.grid_items_map[safe_path] = []
                     self.grid_items_map[safe_path].append(item)
-                    
+
                 else:
                     missing_count += 1
                     item = QListWidgetItem(display_name)
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                    
+
                     pixmap = QPixmap(180, 270)
-                    pixmap.fill(QColor("#44475a")) 
+                    pixmap.fill(QColor("#44475a"))
                     painter = QPainter(pixmap)
-                    painter.setPen(QColor("#ff5555")) 
-                    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "❌ MISSING\n\nClick to\nSearch Web")
+                    painter.setPen(QColor("#ff5555"))
+                    painter.drawText(
+                        pixmap.rect(),
+                        Qt.AlignmentFlag.AlignCenter,
+                        "❌ MISSING\n\nClick to\nSearch Web",
+                    )
                     painter.end()
 
                     item.setIcon(QIcon(pixmap))
                     item.setForeground(QColor("#ff5555"))
                     item.setData(Qt.ItemDataRole.UserRole, match["search_query"])
+                    item.setData(CblNonDigitalBorderDelegate.BORDER_ROLE, True)
                     self.grid_list.addItem(item)
 
-            if hasattr(self, 'cbl_stats_label'):
-                total_count = owned_count + missing_count
-                self.cbl_stats_label.setText(f"📚 Total: {total_count}  |  ✅ Owned: {owned_count}  |  ❌ Missing: {missing_count}")
+            if hasattr(self, "cbl_stats_label"):
+                total_count = owned_count + missing_count + note_count
+                stats = (
+                    f"📚 Total: {total_count}  |  ✅ Owned: {owned_count}  |  "
+                    f"❌ Missing: {missing_count}"
+                )
+                if note_count:
+                    stats += f"  |  📌 Notes: {note_count}"
+                self.cbl_stats_label.setText(stats)
                 self.cbl_stats_label.show()
 
             if owned_files_to_load:
@@ -6141,70 +6840,7 @@ class ComicBrowser(QMainWindow):
         h = int(w * 1.5)
         self._set_grid_item_icon(alive_items, cover_bytes, w, h)
 
-    def on_tree_right_click(self, position):
-        
-        index = self.tree.indexAt(position)
-        if not index.isValid():
-            return
-            
-        source_index = self.proxy_model.mapToSource(index)
-        path = self.model.filePath(source_index)
-        
-        menu = QMenu(self)
-        
-        menu.setStyleSheet("""
-            QMenu { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; } 
-            QMenu::item { padding: 5px 20px; }
-            QMenu::item:selected { background-color: #44475a; }
-        """)
-        
-        open_action = menu.addAction("📂 Open in File Explorer")
-        tagger_action = menu.addAction("🏷️ Send to Tagger")
-        
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        
-        if action == open_action:
-            folder = path if os.path.isdir(path) else os.path.dirname(path)
-            try:
-                os.startfile(folder)
-            except Exception as e:
-                print(f"Could not open folder: {e}")
-        elif action == tagger_action:
-            folder = path if os.path.isdir(path) else os.path.dirname(path)
-            self._ensure_tab_built(self._TAB_TAGGER)
-            self.tagger_tab.receive_folder(folder)
-            self.tabs.setCurrentIndex(self._TAB_TAGGER)
-                
     # --- IDEA 3: EXPORT FOLDER AS .CBL ---
-    def on_tree_right_click(self, position):
-        
-        index = self.tree.indexAt(position)
-        if not index.isValid():
-            return
-            
-        source_index = self.proxy_model.mapToSource(index)
-        path = self.model.filePath(source_index)
-        
-        menu = QMenu(self)
-        
-        # THE FIX: Force the dark theme onto this specific pop-up menu!
-        menu.setStyleSheet("""
-            QMenu { background-color: #282a36; color: #f8f8f2; border: 1px solid #44475a; } 
-            QMenu::item { padding: 5px 20px; }
-            QMenu::item:selected { background-color: #44475a; }
-        """)
-        
-        open_action = menu.addAction("📂 Open in File Explorer")
-        
-        action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        
-        if action == open_action:
-            folder = path if os.path.isdir(path) else os.path.dirname(path)
-            try:
-                os.startfile(folder)
-            except Exception as e:
-                print(f"Could not open folder: {e}")
-
     def export_folder_to_cbl(self):
 
         item = self.lib_list.currentItem()
@@ -6339,10 +6975,22 @@ class ComicBrowser(QMainWindow):
             file_hash = hashlib.md5(file_path.encode('utf-8')).hexdigest()
             cache_path = os.path.join(CACHE_DIR, f"{file_hash}.jpg")
             img_data = None
+            file_list = None
 
             if os.path.exists(cache_path):
                 with open(cache_path, 'rb') as f:
                     img_data = f.read()
+            else:
+                # Fast path: reuse in-memory grid cover bytes to avoid expensive first
+                # archive image extraction on first Details open.
+                mem_cover = getattr(self, '_cover_bytes_cache', {}).get(file_path)
+                if mem_cover:
+                    img_data = mem_cover
+                    try:
+                        with open(cache_path, 'wb') as f:
+                            f.write(img_data)
+                    except Exception as _e:
+                        log.warning("Suppressed exception: %s", _e)
 
             if file_path.lower().endswith('.cbz'):
                 archive = zipfile.ZipFile(file_path, 'r')
@@ -6350,8 +6998,8 @@ class ComicBrowser(QMainWindow):
                 archive = rarfile.RarFile(file_path, 'r')
 
             with archive as af:
-                file_list = af.namelist()
                 if not img_data:
+                    file_list = af.namelist()
                     image_files = [f for f in file_list if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
                     image_files = [f for f in image_files if not f.endswith('/') and not f.endswith('\\')]
                     image_files.sort()
@@ -6377,10 +7025,25 @@ class ComicBrowser(QMainWindow):
 
                 raw_filename = os.path.basename(file_path)
                 filename_only, _ = os.path.splitext(raw_filename)
-                xml_filename = next((f for f in file_list if f.lower() == 'comicinfo.xml'), None)
+
+                # Faster XML lookup first; only enumerate all names if needed.
+                xml_data = None
+                for candidate in ("ComicInfo.xml", "comicinfo.xml", "COMICINFO.XML"):
+                    try:
+                        xml_data = af.read(candidate)
+                        if xml_data:
+                            break
+                    except Exception:
+                        pass
+
+                if xml_data is None:
+                    if file_list is None:
+                        file_list = af.namelist()
+                    xml_filename = next((f for f in file_list if f.lower() == 'comicinfo.xml'), None)
+                    if xml_filename:
+                        xml_data = af.read(xml_filename)
                 
-                if xml_filename:
-                    xml_data = af.read(xml_filename)
+                if xml_data:
                     xml_str = xml_data.decode('utf-8', errors='ignore')
                     xml_str = re.sub(r'\sxmlns="[^"]+"', '', xml_str, count=1)
                     self._current_xml_str = xml_str  # stash for dialog
@@ -6606,6 +7269,18 @@ class ComicBrowser(QMainWindow):
         self.tree.setCurrentIndex(proxy_idx)
         self.tree.scrollTo(proxy_idx, QAbstractItemView.ScrollHint.PositionAtCenter)
 
+    def _grid_item_copy_name_for_clipboard(self, item):
+        """Visible grid title with UI prefixes (owned/missing markers, CBL icon) stripped."""
+        t = (item.text() or "").strip()
+        while True:
+            before = t
+            for prefix in ("✅ ", "📋 "):
+                if t.startswith(prefix):
+                    t = t[len(prefix) :].lstrip()
+            if t == before:
+                break
+        return t
+
     def show_grid_context_menu(self, pos):
         
         item = self.grid_list.itemAt(pos)
@@ -6618,6 +7293,14 @@ class ComicBrowser(QMainWindow):
         # IF YOU CLICKED EMPTY BACKGROUND SPACE -> UNHIDE OPTION!
         if not item:
             unhide_action = menu.addAction("👁️ Unhide All Hidden Items")
+            mf_empty_action = None
+            if (
+                getattr(self, "current_cbl_path", None)
+                and os.path.isfile(self.current_cbl_path)
+                and getattr(self, "refresh_cbl_btn", None)
+                and self.refresh_cbl_btn.isVisible()
+            ):
+                mf_empty_action = menu.addAction("🔍 Match finder…")
             action = menu.exec(self.grid_list.mapToGlobal(pos))
             if action == unhide_action:
                 self.hidden_paths.clear()
@@ -6625,6 +7308,8 @@ class ComicBrowser(QMainWindow):
                 self.proxy_model.invalidateFilter() # Refresh Left Tree
                 if getattr(self, 'current_grid_folder', None):
                     self.load_folder_grid(self.current_grid_folder) # Refresh Grid
+            elif mf_empty_action and action == mf_empty_action:
+                self._open_match_finder_dialog()
             return
 
         # IF YOU CLICKED A COMIC/FOLDER -> HIDE & EDIT OPTIONS!
@@ -6633,6 +7318,8 @@ class ComicBrowser(QMainWindow):
         # CBL gets its own menu
         if user_str.startswith("CBL:"):
             cbl_path = user_str[4:]
+            copy_name_action = menu.addAction("📄 Copy name")
+            whats_about_action = menu.addAction("❓ What's this about?")
             open_cbl_action    = menu.addAction("📋 Open Reading List")
             goto_cbl_action    = menu.addAction("📍 Go to File Location")
             menu.addSeparator()
@@ -6642,7 +7329,11 @@ class ComicBrowser(QMainWindow):
             menu.addSeparator()
             cbl_delete_action  = menu.addAction("🗑️ Delete (Recycle Bin)")
             action = menu.exec(self.grid_list.mapToGlobal(pos))
-            if action == open_cbl_action and os.path.exists(cbl_path):
+            if action == copy_name_action:
+                QApplication.clipboard().setText(self._grid_item_copy_name_for_clipboard(item))
+            elif action == whats_about_action:
+                self._send_whats_this_about_to_chat(item)
+            elif action == open_cbl_action and os.path.exists(cbl_path):
                 self.tabs.setCurrentIndex(1)
                 self.load_cbl_grid(cbl_path)
             elif action == goto_cbl_action:
@@ -6697,6 +7388,8 @@ class ComicBrowser(QMainWindow):
                 self._grid_delete_paths_to_trash([os.path.normpath(cbl_path)])
             return
 
+        copy_name_action = menu.addAction("📄 Copy name")
+        whats_about_action = menu.addAction("❓ What's this about?")
         link_action = menu.addAction("🔗 Smart-Link Comic(s)")
         tagger_action = menu.addAction("🏷️ Send to Tagger")
         goto_action = menu.addAction("📍 Go to File Location")
@@ -6710,11 +7403,30 @@ class ComicBrowser(QMainWindow):
         delete_action = menu.addAction("🗑️ Delete (Recycle Bin)")
         menu.addSeparator()
         hide_action = menu.addAction("🙈 Hide Item (Remove from Grid)")
-        
+        save_missing_action = None
+        match_finder_action = None
+        if (
+            getattr(self, "current_cbl_path", None)
+            and os.path.isfile(self.current_cbl_path)
+            and getattr(self, "refresh_cbl_btn", None)
+            and self.refresh_cbl_btn.isVisible()
+        ):
+            menu.addSeparator()
+            save_missing_action = menu.addAction("💾 Save missing issues list…")
+            match_finder_action = menu.addAction("🔍 Match finder…")
+
         action = menu.exec(self.grid_list.mapToGlobal(pos))
-        
-        if action == link_action:
+
+        if action == copy_name_action:
+            QApplication.clipboard().setText(self._grid_item_copy_name_for_clipboard(item))
+        elif action == whats_about_action:
+            self._send_whats_this_about_to_chat(item)
+        elif action == link_action:
             self.manual_link_comics(item)
+        elif save_missing_action and action == save_missing_action:
+            self._save_cbl_missing_list_text()
+        elif match_finder_action and action == match_finder_action:
+            self._open_match_finder_dialog(item)
         elif action == tagger_action:
             if not user_str.startswith("MISSING:"):
                 target_path = user_str.split("FOLDER:")[1] if user_str.startswith("FOLDER:") else user_str
@@ -7155,140 +7867,217 @@ class ComicBrowser(QMainWindow):
             else:
                 self.update_grid_icon(target_path, dialog.selected_bytes)
     
-    def manual_link_comics(self, start_item):
-
-        # 1. Ask user for files (Allows selecting MULTIPLE files in any order!)
-        file_paths, _ = QFileDialog.getOpenFileNames(
-            self, 
-            "Select Comic(s) to Link", 
-            "", 
-            "Comic Archives (*.cbz *.cbr)"
+    def _cbl_grid_accepts_manual_links(self) -> bool:
+        return bool(
+            getattr(self, "current_cbl_path", None)
+            and os.path.isfile(self.current_cbl_path)
+            and getattr(self, "refresh_cbl_btn", None)
+            and self.refresh_cbl_btn.isVisible()
         )
-        if not file_paths: return
 
-        # 2. Grab the Base Series name of the item we clicked to prevent cross-contamination
-        clicked_text = start_item.text().split('\n')[0]
-        base_match = re.search(r'^(.*?)\s*#', clicked_text)
-        base_series = base_match.group(1).strip().lower() if base_match else clicked_text.split()[0].lower()
+    def _remove_item_path_from_grid_map(self, item):
+        try:
+            old = item.data(Qt.ItemDataRole.UserRole)
+        except RuntimeError:
+            return
+        old_s = str(old or "")
+        if not old_s or old_s.startswith("MISSING:") or old_s.startswith("FOLDER:"):
+            return
+        if old_s.startswith("CBL:"):
+            return
+        op = os.path.normpath(old_s)
+        if op not in self.grid_items_map:
+            return
+        lst = self.grid_items_map[op]
+        try:
+            if item in lst:
+                lst.remove(item)
+        except ValueError:
+            pass
+        if not lst:
+            del self.grid_items_map[op]
 
-        # 3. SMART PARSER: Extract the issue number from every selected file!
-        files_by_issue = {}
-        fallback_files = []
-        
-        for path in file_paths:
-            base_name = os.path.splitext(os.path.basename(path))[0]
-            clean_name = re.sub(r'\(.*?\)|\[.*?\]', '', base_name).strip()
-            
-            m_hash = re.search(r'#\s*(\d+)', clean_name)
-            m_vol_and_iss = re.search(r'(?i)\b(?:v|vol|volume)\.?\s*\d+(?:\s*[-–—:]\s*|\s+)(\d+)(?:\s+[-–—:]|\s*$)', clean_name)
-            m_vol_only = re.search(r'(?i)\b(?:v|vol|volume|book|bk|tpb)\.?\s*(\d+)(?:\s+[-–—:]|\s*$)', clean_name)
-            m_iss_only = re.search(r'\s+(\d+)(?:\s+[-–—:]|\s*$)', clean_name)
-            
-            f_issue = ""
-            if m_hash: f_issue = str(int(m_hash.group(1)))
-            elif m_vol_and_iss: f_issue = str(int(m_vol_and_iss.group(1)))
-            elif m_vol_only: f_issue = str(int(m_vol_only.group(1)))
-            elif m_iss_only: f_issue = str(int(m_iss_only.group(1)))
-            
-            if f_issue:
-                files_by_issue[f_issue] = path
-            else:
-                fallback_files.append(path) # If we can't find a number, save it for later
+    def _apply_comic_to_cbl_grid_item(self, item, matched_path, matches, files_to_load):
+        self._remove_item_path_from_grid_map(item)
+        row = self.grid_list.row(item)
+        safe_path = os.path.normpath(matched_path)
+        item.setData(Qt.ItemDataRole.UserRole, safe_path)
+        if matches and row < len(matches):
+            display_name = matches[row].get("display_name", "Linked Comic")
+            matches[row]["path"] = safe_path
+            matches[row]["manual_link"] = True
+        else:
+            display_name = os.path.basename(safe_path)
+        item.setText(display_name)
+        iw = max(1, self.grid_list.iconSize().width())
+        ih = max(1, self.grid_list.iconSize().height())
+        pixmap = QPixmap(iw, ih)
+        pixmap.fill(QColor("#21222c"))
+        painter = QPainter(pixmap)
+        painter.setPen(QColor("#50fa7b"))
+        painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "⏳ Loading...")
+        painter.end()
+        item.setIcon(QIcon(pixmap))
+        item.setForeground(Qt.GlobalColor.white)
+        if not _cbl_word_digital_in_path(safe_path):
+            item.setData(CblNonDigitalBorderDelegate.BORDER_ROLE, True)
+        else:
+            item.setData(CblNonDigitalBorderDelegate.BORDER_ROLE, False)
+        if safe_path not in self.grid_items_map:
+            self.grid_items_map[safe_path] = []
+        self.grid_items_map[safe_path].append(item)
+        files_to_load.append(safe_path)
 
-        # 4. Open the Lightning Cache to save the overrides permanently
+    def on_cbl_grid_file_dropped(self, path: str, item):
+        if not item:
+            return
+        drop_role = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        if drop_role.startswith("NOTE:"):
+            return
+        if not path or not os.path.isfile(path):
+            return
+        if not self._cbl_grid_accepts_manual_links():
+            return
         cache_file = "cbl_match_cache.json"
         cache_data = {}
         if os.path.exists(cache_file):
             try:
-                with open(cache_file, 'r') as f: cache_data = json.load(f)
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
             except Exception as _e:
                 log.warning("Suppressed exception: %s", _e)
         matches = []
-        if getattr(self, 'current_cbl_path', None) and self.current_cbl_path in cache_data:
-            matches = cache_data[self.current_cbl_path].get('matches', [])
-
+        if self.current_cbl_path in cache_data:
+            matches = cache_data[self.current_cbl_path].get("matches", [])
         files_to_load = []
-        start_row = self.grid_list.row(start_item)
-        
-        # 5. THE AUTO-SLOTTER: Scan downward from where they clicked
-        for row in range(start_row, self.grid_list.count()):
-            # If we've successfully mapped all selected files, stop scanning!
-            if not files_by_issue and not fallback_files:
-                break
-                
-            item = self.grid_list.item(row)
-            item_text = item.text().split('\n')[0]
-            
-            # Guard: Only fill slots that belong to the same series we clicked on!
-            if base_series and base_series not in item_text.lower():
-                continue 
-                
-            # Extract the issue number the grid slot is asking for
-            slot_num_match = re.search(r'#(\d+)', item_text)
-            if not slot_num_match:
-                u_data = str(item.data(Qt.ItemDataRole.UserRole))
-                if "MISSING:" in u_data:
-                    slot_num_match = re.search(r'\s+(\d+)\s+', u_data.split("MISSING:")[1])
-                    
-            if slot_num_match:
-                slot_issue = str(int(slot_num_match.group(1)))
-                matched_path = None
-                
-                # MATHEMATICAL MATCH! Does this slot's issue number exist in our selected files?
-                if slot_issue in files_by_issue:
-                    matched_path = files_by_issue.pop(slot_issue) 
-                elif fallback_files:
-                    matched_path = fallback_files.pop(0)
-                    
-                if matched_path:
-                    safe_path = os.path.normpath(matched_path)
-                    
-                    # Inject path into UI Item
-                    item.setData(Qt.ItemDataRole.UserRole, safe_path)
-                    
-                    # Clean up the display name
-                    if matches and row < len(matches):
-                        display_name = matches[row].get("display_name", "Linked Comic")
-                        matches[row]["path"] = safe_path
-                    else:
-                        display_name = os.path.basename(safe_path)
-                        
-                    item.setText(display_name)
-                    
-                    # Create a green "Loading" icon
-                    pixmap = QPixmap(180, 270)
-                    pixmap.fill(QColor("#21222c")) 
-                    painter = QPainter(pixmap)
-                    painter.setPen(QColor("#50fa7b")) 
-                    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "⏳ Loading...")
-                    painter.end()
-                    item.setIcon(QIcon(pixmap))
-                    item.setForeground(Qt.GlobalColor.white)
-                    
-                    if safe_path not in self.grid_items_map:
-                        self.grid_items_map[safe_path] = []
-                    self.grid_items_map[safe_path].append(item)
-                    
-                    files_to_load.append(safe_path)
-
-        # 6. Save the cache to the hard drive
+        self._apply_comic_to_cbl_grid_item(item, path, matches, files_to_load)
         if self.current_cbl_path and matches:
-            cache_data[self.current_cbl_path]['matches'] = matches
+            cache_data[self.current_cbl_path]["matches"] = matches
             try:
-                with open(cache_file, 'w') as f:
+                with open(cache_file, "w", encoding="utf-8") as f:
                     json.dump(cache_data, f)
             except Exception as _e:
                 log.warning("Suppressed exception: %s", _e)
-        # 7. Spin up the image extractor thread for the newly linked files!
         if files_to_load:
-            unique_files = list(set(files_to_load))
-            if getattr(self, 'cover_thread', None) and self.cover_thread.isRunning():
+            unique_files = list(dict.fromkeys(files_to_load))
+            if getattr(self, "cover_thread", None) and self.cover_thread.isRunning():
                 self.cover_thread.stop()
                 self.cover_thread.wait()
-                
             self.cover_thread = CoverLoaderThread(unique_files)
             self.cover_thread.cover_loaded.connect(self.update_grid_icon)
             self.cover_thread.start()
+
+    def manual_link_comics(self, start_item):
+
+        file_paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Comic(s) to Link",
+            "",
+            "Comic Archives (*.cbz *.cbr)",
+        )
+        if not file_paths:
+            return
+
+        clicked_text = start_item.text().split("\n")[0]
+        base_match = re.search(r"^(.*?)\s*#", clicked_text)
+        base_series = (
+            base_match.group(1).strip().lower() if base_match else clicked_text.split()[0].lower()
+        )
+
+        files_by_issue = {}
+        fallback_files = []
+
+        for path in file_paths:
+            base_name = os.path.splitext(os.path.basename(path))[0]
+            clean_name = re.sub(r"\(.*?\)|\[.*?\]", "", base_name).strip()
+
+            m_hash = re.search(r"#\s*(\d+)", clean_name)
+            m_vol_and_iss = re.search(
+                r"(?i)\b(?:v|vol|volume)\.?\s*\d+(?:\s*[-–—:]\s*|\s+)(\d+)(?:\s+[-–—:]|\s*$)",
+                clean_name,
+            )
+            m_vol_only = re.search(
+                r"(?i)\b(?:v|vol|volume|book|bk|tpb)\.?\s*(\d+)(?:\s+[-–—:]|\s*$)",
+                clean_name,
+            )
+            m_iss_only = re.search(r"\s+(\d+)(?:\s+[-–—:]|\s*$)", clean_name)
+
+            f_issue = ""
+            if m_hash:
+                f_issue = str(int(m_hash.group(1)))
+            elif m_vol_and_iss:
+                f_issue = str(int(m_vol_and_iss.group(1)))
+            elif m_vol_only:
+                f_issue = str(int(m_vol_only.group(1)))
+            elif m_iss_only:
+                f_issue = str(int(m_iss_only.group(1)))
+
+            if f_issue:
+                files_by_issue[f_issue] = path
+            else:
+                fallback_files.append(path)
+
+        cache_file = "cbl_match_cache.json"
+        cache_data = {}
+        if os.path.exists(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+            except Exception as _e:
+                log.warning("Suppressed exception: %s", _e)
+        matches = []
+        if getattr(self, "current_cbl_path", None) and self.current_cbl_path in cache_data:
+            matches = cache_data[self.current_cbl_path].get("matches", [])
+
+        files_to_load = []
+        start_row = self.grid_list.row(start_item)
+
+        for row in range(start_row, self.grid_list.count()):
+            if not files_by_issue and not fallback_files:
+                break
+
+            item = self.grid_list.item(row)
+            item_text = item.text().split("\n")[0]
+
+            if base_series and base_series not in item_text.lower():
+                continue
+
+            slot_num_match = re.search(r"#(\d+)", item_text)
+            if not slot_num_match:
+                u_data = str(item.data(Qt.ItemDataRole.UserRole))
+                if "MISSING:" in u_data:
+                    slot_num_match = re.search(r"\s+(\d+)\s+", u_data.split("MISSING:")[1])
+
+            if slot_num_match:
+                slot_issue = str(int(slot_num_match.group(1)))
+                matched_path = None
+
+                if slot_issue in files_by_issue:
+                    matched_path = files_by_issue.pop(slot_issue)
+                elif fallback_files:
+                    matched_path = fallback_files.pop(0)
+
+                if matched_path:
+                    self._apply_comic_to_cbl_grid_item(item, matched_path, matches, files_to_load)
+
+        if self.current_cbl_path and matches:
+            cache_data[self.current_cbl_path]["matches"] = matches
+            try:
+                with open(cache_file, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f)
+            except Exception as _e:
+                log.warning("Suppressed exception: %s", _e)
+
+        if files_to_load:
+            unique_files = list(dict.fromkeys(files_to_load))
+            if getattr(self, "cover_thread", None) and self.cover_thread.isRunning():
+                self.cover_thread.stop()
+                self.cover_thread.wait()
+
+            self.cover_thread = CoverLoaderThread(unique_files)
+            self.cover_thread.cover_loaded.connect(self.update_grid_icon)
+            self.cover_thread.start()
+
     def on_tree_right_click(self, position):
         
         index = self.tree.indexAt(position)
@@ -7307,21 +8096,431 @@ class ComicBrowser(QMainWindow):
         """)
         
         open_action = menu.addAction("📂 Open in File Explorer")
+        tree_whats_about_action = menu.addAction("❓ What's this about?")
         tagger_action = menu.addAction("🏷️ Send to Batch Tagger")
-        
+        map_cbl_action = None
+        missing_report_action = None
+        if os.path.isdir(path):
+            menu.addSeparator()
+            map_cbl_action = menu.addAction("🗺️ Map .cbls")
+            missing_report_action = menu.addAction("📝 Missing issue report")
+
         action = menu.exec(self.tree.viewport().mapToGlobal(position))
-        
+
         if action == open_action:
             folder = path if os.path.isdir(path) else os.path.dirname(path)
             try:
                 os.startfile(folder)
             except Exception as e:
                 print(f"Could not open folder: {e}")
+        elif action == tree_whats_about_action:
+            self._send_whats_this_about_to_fs_path(path)
         elif action == tagger_action:
             folder = path if os.path.isdir(path) else os.path.dirname(path)
             self._ensure_tab_built(self._TAB_TAGGER)
             self.tagger_tab.receive_folder(folder)
             self.tabs.setCurrentIndex(self._TAB_TAGGER)
+        elif map_cbl_action and action == map_cbl_action:
+            self._map_cbls_in_folder(path)
+        elif missing_report_action and action == missing_report_action:
+            self._missing_issue_report_for_folder(path)
+
+    def _open_match_finder_dialog(self, grid_item=None, scroll_to_row=None):
+        if scroll_to_row is None and grid_item is not None:
+            scroll_to_row = self.grid_list.row(grid_item)
+        if not getattr(self, "current_cbl_path", None) or not os.path.isfile(self.current_cbl_path):
+            _themed_information(
+                self,
+                "Match finder",
+                "Open a reading list in the grid first.",
+            )
+            return
+        if not self._cbl_grid_accepts_manual_links():
+            _themed_information(
+                self,
+                "Match finder",
+                "Reading list mode is not active (open a .cbl in the grid).",
+            )
+            return
+        dlg = CblMatchFinderDialog(self, parent=self, scroll_to_row=scroll_to_row)
+        dlg.exec()
+
+    def _make_themed_progress_dialog(self, title: str, label: str, maximum: int):
+        progress = QProgressDialog(label, "", 0, max(0, int(maximum)), self)
+        progress.setWindowTitle(title)
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        theme = APP_SETTINGS.get("theme", "dracula")
+        if theme == "black":
+            pd_bg, pd_text, pd_border, pd_chunk = "#121212", "#E0E0E0", "#444444", "#888888"
+        else:
+            pd_bg, pd_text, pd_border, pd_chunk = "#282a36", "#f8f8f2", "#44475a", "#6272a4"
+        progress.setStyleSheet(
+            f"""
+            QProgressDialog {{
+                background-color: {pd_bg};
+                color: {pd_text};
+            }}
+            QProgressDialog QLabel {{
+                color: {pd_text};
+                background: transparent;
+            }}
+            QProgressBar {{
+                background-color: #21222c;
+                color: {pd_text};
+                border: 1px solid {pd_border};
+                border-radius: 4px;
+                text-align: center;
+            }}
+            QProgressBar::chunk {{
+                background-color: {pd_chunk};
+            }}
+            """
+        )
+        progress.show()
+        QApplication.processEvents()
+        return progress
+
+    def _format_cbl_issue_line(self, series: str, volume: str, issue_raw: str, year: str):
+        s = (series or "").strip()
+        v = (volume or "").strip()
+        n_raw = (issue_raw or "").strip()
+        y = (year or "").strip()
+        n_match = re.search(r"(\d+[a-zA-Z]?)", n_raw)
+        n = n_match.group(1).lstrip("0") or "0" if n_match else ""
+        parts = [s] if s else []
+        if v:
+            vd = re.sub(r"\D", "", v)
+            parts.append(f"Vol {str(int(vd)) if vd.isdigit() else v}")
+        if n:
+            parts.append(n)
+        if y:
+            parts.append(y)
+        parts.append("digital")
+        return " ".join(parts).strip()
+
+    def _cbl_year_from_path(self, cbl_path: str) -> str:
+        name = os.path.splitext(os.path.basename(cbl_path))[0]
+        m = re.search(r"[\[\(](19\d{2}|20\d{2})[\]\)]", name)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"\b(19\d{2}|20\d{2})\b", name)
+        if m2:
+            return m2.group(1)
+        return ""
+
+    def _issue_sort_key(self, info):
+        series = (info.get("series") or "").lower()
+        v_raw = str(info.get("volume") or "")
+        n_raw = str(info.get("issue") or "")
+        y_raw = str(info.get("year") or "")
+        v_digits = re.sub(r"\D", "", v_raw)
+        n_match = re.match(r"(\d+)([a-zA-Z]?)", n_raw)
+        y_digits = re.sub(r"\D", "", y_raw)
+        v_key = int(v_digits) if v_digits.isdigit() else 999999
+        n_num = int(n_match.group(1)) if n_match else 999999
+        n_sfx = (n_match.group(2) or "").lower() if n_match else ""
+        y_key = int(y_digits) if y_digits.isdigit() else 999999
+        return (series, n_num, n_sfx, v_key, y_key)
+
+    def _map_cbls_in_folder(self, folder_path: str):
+        folder_path = os.path.normpath(folder_path)
+        if not os.path.isdir(folder_path):
+            return
+
+        cbl_files = []
+        for dirpath, _, filenames in os.walk(folder_path):
+            for name in filenames:
+                if name.lower().endswith(".cbl"):
+                    cbl_files.append(os.path.normpath(os.path.join(dirpath, name)))
+        cbl_files.sort(key=lambda p: natural_sort_key(os.path.relpath(p, folder_path).lower()))
+
+        if not cbl_files:
+            _themed_information(
+                self,
+                "Map .cbls",
+                f"No .cbl files found in:\n{folder_path}",
+            )
+            return
+
+        progress = self._make_themed_progress_dialog("Map .cbls", "Preparing CBL cache...", len(cbl_files))
+
+        cached = 0
+        errors = []
+
+        for idx, cbl_path in enumerate(cbl_files, start=1):
+            rel_name = os.path.relpath(cbl_path, folder_path)
+            progress.setLabelText(f"Caching {idx}/{len(cbl_files)}\n{rel_name}")
+            progress.setValue(idx - 1)
+            QApplication.processEvents()
+            try:
+                self.load_cbl_grid(cbl_path, force_refresh=True)
+                cache_file = "cbl_match_cache.json"
+                ok = False
+                if os.path.isfile(cache_file):
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        cache_data = json.load(f)
+                    entry = cache_data.get(cbl_path, {})
+                    ok = bool(entry.get("matches")) or (
+                        entry.get("mtime") == (os.path.getmtime(cbl_path) if os.path.exists(cbl_path) else None)
+                    )
+                if ok:
+                    cached += 1
+                else:
+                    errors.append((cbl_path, "No cache entry written."))
+            except Exception as e:
+                errors.append((cbl_path, str(e)))
+
+        progress.setValue(len(cbl_files))
+        progress.close()
+
+        msg = (
+            f"Finished mapping .cbl files.\n\n"
+            f"Total found: {len(cbl_files)}\n"
+            f"Cached: {cached}\n"
+            f"Errors: {len(errors)}"
+        )
+        if errors:
+            msg += "\n\nFirst errors:"
+            for ep, err in errors[:10]:
+                msg += f"\n- {os.path.basename(ep)}: {err}"
+            if len(errors) > 10:
+                msg += f"\n- ... and {len(errors) - 10} more."
+        _themed_information(self, "Map .cbls complete", msg)
+
+    def _missing_issue_report_for_folder(self, folder_path: str):
+        folder_path = os.path.normpath(folder_path)
+        if not os.path.isdir(folder_path):
+            return
+
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save missing issue report",
+            "",
+            "Text files (*.txt);;All files (*.*)",
+        )
+        if not out_path:
+            return
+
+        cbl_files = []
+        for dirpath, _, filenames in os.walk(folder_path):
+            for name in filenames:
+                if name.lower().endswith(".cbl"):
+                    cbl_files.append(os.path.normpath(os.path.join(dirpath, name)))
+        cbl_files.sort(key=lambda p: natural_sort_key(os.path.relpath(p, folder_path).lower()))
+
+        if not cbl_files:
+            _themed_information(
+                self,
+                "Missing issue report",
+                f"No .cbl files found in:\n{folder_path}",
+            )
+            return
+
+        progress = self._make_themed_progress_dialog(
+            "Missing issue report",
+            "Preparing report...",
+            len(cbl_files),
+        )
+
+        missing_entries = []
+        nondigital_entries = []
+        missing_by_cbl = {}
+        errors = []
+        cache_file = "cbl_match_cache.json"
+        cache_data = {}
+        if os.path.isfile(cache_file):
+            try:
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+            except Exception:
+                cache_data = {}
+
+        for idx, cbl_path in enumerate(cbl_files, start=1):
+            rel_name = os.path.relpath(cbl_path, folder_path)
+            progress.setLabelText(f"Scanning {idx}/{len(cbl_files)}\n{rel_name}")
+            progress.setValue(idx - 1)
+            QApplication.processEvents()
+            try:
+                cbl_fallback_year = self._cbl_year_from_path(cbl_path)
+                cbl_mtime = os.path.getmtime(cbl_path) if os.path.exists(cbl_path) else 0
+                entry = cache_data.get(cbl_path, {})
+                cache_is_fresh = (
+                    bool(entry)
+                    and entry.get("mtime") == cbl_mtime
+                    and isinstance(entry.get("matches"), list)
+                )
+
+                if cache_is_fresh:
+                    matches = entry.get("matches", [])
+                else:
+                    progress.setLabelText(f"Caching {idx}/{len(cbl_files)}\n{rel_name}")
+                    QApplication.processEvents()
+                    self.load_cbl_grid(cbl_path, force_refresh=True)
+                    if os.path.isfile(cache_file):
+                        with open(cache_file, "r", encoding="utf-8") as f:
+                            cache_data = json.load(f)
+                    matches = cache_data.get(cbl_path, {}).get("matches", [])
+
+                root = ET.parse(cbl_path).getroot()
+                books = root.findall(".//Book")
+                cbl_total = 0
+                cbl_missing = []
+                for row, book in enumerate(books):
+                    c_series = book.get("Series", "")
+                    c_num_raw = (book.get("Number") or "").strip()
+                    c_year = (book.get("Year") or "").strip() or cbl_fallback_year
+                    c_volume = (book.get("Volume") or "").strip()
+                    if _cbl_book_is_reading_order_note(c_series, c_num_raw):
+                        continue
+                    m = matches[row] if row < len(matches) else {}
+                    if m.get("is_note"):
+                        continue
+                    cbl_total += 1
+                    issue_line = self._format_cbl_issue_line(c_series, c_volume, c_num_raw, c_year)
+                    if not issue_line:
+                        continue
+                    match_path = os.path.normpath(m.get("path") or "")
+                    info = {
+                        "line": issue_line,
+                        "series": c_series,
+                        "volume": c_volume,
+                        "issue": c_num_raw,
+                        "year": c_year,
+                    }
+                    if not match_path or not os.path.isfile(match_path):
+                        missing_entries.append(info)
+                        cbl_missing.append(info)
+                    elif not _cbl_word_digital_in_path(match_path):
+                        nd = dict(info)
+                        nd["filename"] = os.path.basename(match_path)
+                        nondigital_entries.append(nd)
+                missing_by_cbl[cbl_path] = {
+                    "name": os.path.basename(cbl_path),
+                    "total": cbl_total,
+                    "missing": cbl_missing,
+                }
+            except Exception as e:
+                errors.append((cbl_path, str(e)))
+
+        progress.setValue(len(cbl_files))
+        progress.close()
+
+        missing_entries.sort(key=self._issue_sort_key)
+        nondigital_entries.sort(key=self._issue_sort_key)
+
+        lines = []
+        lines.append("MISSING ISSUES")
+        lines.append("")
+        if missing_entries:
+            wrote_any = False
+            for cbl_path in cbl_files:
+                block = missing_by_cbl.get(cbl_path) or {}
+                block_missing = list(block.get("missing") or [])
+                if not block_missing:
+                    continue
+                wrote_any = True
+                block_missing.sort(key=self._issue_sort_key)
+                lines.append(
+                    f"{block.get('name', os.path.basename(cbl_path))} - missing {len(block_missing)} of {int(block.get('total') or 0)}"
+                )
+                lines.append("")
+                for ent in block_missing:
+                    lines.append(ent["line"])
+                lines.append("")
+            if not wrote_any:
+                lines.append("None")
+        else:
+            lines.append("None")
+
+        lines.append("")
+        lines.append("NON DIGITAL ISSUES")
+        lines.append("")
+        if nondigital_entries:
+            for ent in nondigital_entries:
+                lines.append(ent["line"])
+                lines.append(ent.get("filename", ""))
+                lines.append("")
+        else:
+            lines.append("None")
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except OSError as e:
+            QMessageBox.warning(self, "Save failed", str(e))
+            return
+
+        msg = (
+            f"Report saved to:\n{out_path}\n\n"
+            f"CBLs scanned: {len(cbl_files)}\n"
+            f"Missing issues: {len(missing_entries)}\n"
+            f"Non digital issues: {len(nondigital_entries)}\n"
+            f"Errors: {len(errors)}"
+        )
+        if errors:
+            msg += "\n\nFirst errors:"
+            for ep, err in errors[:10]:
+                msg += f"\n- {os.path.basename(ep)}: {err}"
+            if len(errors) > 10:
+                msg += f"\n- ... and {len(errors) - 10} more."
+        _themed_information(self, "Missing issue report complete", msg)
+
+    def _save_cbl_missing_list_text(self):
+        cbl_path = getattr(self, "current_cbl_path", None)
+        if not cbl_path or not os.path.isfile(cbl_path):
+            return
+        lines = [
+            f"# Missing issues — {os.path.basename(cbl_path)}",
+            "",
+        ]
+        count = 0
+        for i in range(self.grid_list.count()):
+            it = self.grid_list.item(i)
+            u = str(it.data(Qt.ItemDataRole.UserRole) or "")
+            label = self._grid_item_copy_name_for_clipboard(it)
+            if u.startswith("NOTE:"):
+                continue
+            if u.startswith("MISSING:"):
+                count += 1
+                lines.append(f"{count}. {label}")
+                lines.append(f"   data: {u}")
+                lines.append("")
+            elif u and not u.startswith("FOLDER:") and not u.startswith("CBL:"):
+                p = os.path.normpath(u)
+                if not os.path.isfile(p):
+                    count += 1
+                    lines.append(f"{count}. {label}")
+                    lines.append(f"   (file missing on disk): {p}")
+                    lines.append("")
+        if count == 0:
+            _themed_information(
+                self,
+                "Missing list",
+                "No missing issues in this reading list.",
+            )
+            return
+        out_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save missing issues list",
+            "",
+            "Text files (*.txt);;All files (*.*)",
+        )
+        if not out_path:
+            return
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except OSError as e:
+            QMessageBox.warning(self, "Save failed", str(e))
+            return
+        _themed_information(
+            self,
+            "Saved",
+            f"Wrote {count} missing entr{'ies' if count != 1 else 'y'} to:\n{out_path}",
+        )
 
     def apply_dark_theme(self):
         theme = APP_SETTINGS.get("theme", "dracula")

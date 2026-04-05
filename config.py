@@ -3,6 +3,11 @@ import json
 import logging
 import os
 
+# Directory containing this file (project root when running from source)
+_APP_ROOT = os.path.dirname(os.path.abspath(__file__))
+# Taskbar / window title icon — place comic.ico next to main.py / config.py
+APP_ICON_PATH = os.path.join(_APP_ROOT, "comic.ico")
+
 logging.basicConfig(
     level=logging.WARNING,
     format='%(asctime)s %(levelname)s %(name)s: %(message)s',

@@ -1,11 +1,13 @@
 """Entry point for ComicVault application."""
+import os
 import sys
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtGui import QImageReader
+from PyQt6.QtGui import QImageReader, QIcon
 from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
 
 from app_ui import ComicBrowser
+from config import APP_ICON_PATH
 
 
 def _qt_message_filter(msg_type, context, message):
@@ -28,6 +30,9 @@ def main():
     QImageReader.setAllocationLimit(0)  # Remove 256MB restriction for large comics
 
     app = QApplication(sys.argv)
+    if os.path.isfile(APP_ICON_PATH):
+        app.setWindowIcon(QIcon(APP_ICON_PATH))
+
     window = ComicBrowser()
     window.show()
     sys.exit(app.exec())
