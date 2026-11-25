@@ -9,7 +9,10 @@ from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
 from app_ui import ComicBrowser
 from config import APP_ICON_PATH
 
-import pyi_splash
+try:
+    import pyi_splash
+except ImportError:
+    pyi_splash = None
 
 
 def _qt_message_filter(msg_type, context, message):
@@ -37,7 +40,8 @@ def main():
 
     window = ComicBrowser()
     window.show()
-    pyi_splash.close()
+    if pyi_splash is not None:
+        pyi_splash.close()
     sys.exit(app.exec())
 
 
