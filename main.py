@@ -9,6 +9,8 @@ from PyQt6.QtCore import qInstallMessageHandler, QtMsgType
 from app_ui import ComicBrowser
 from config import APP_ICON_PATH
 
+import pyi_splash
+
 
 def _qt_message_filter(msg_type, context, message):
     """Suppress harmless Qt noise in console."""
@@ -35,6 +37,7 @@ def main():
 
     window = ComicBrowser()
     window.show()
+    pyi_splash.close()
     sys.exit(app.exec())
 
 
